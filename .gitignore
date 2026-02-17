@@ -1,0 +1,9 @@
+node_modules/
+build/
+.gradle/
+*.iml
+.idea/
+.DS_Store
+*.xcworkspace
+*.xcuserdata
+Pods/

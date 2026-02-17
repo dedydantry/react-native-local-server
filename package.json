@@ -1,0 +1,43 @@
+{
+  "name": "react-native-local-server",
+  "version": "0.1.0",
+  "description": "React Native local static file server for iOS and Android. Pure native sockets, zero dependencies, chunked streaming.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "react-native",
+    "ios",
+    "android",
+    "server",
+    "static",
+    "local",
+    "http",
+    "file-server",
+    "streaming"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dedydantry/react-native-local-server.git"
+  },
+  "bugs": {
+    "url": "https://github.com/dedydantry/react-native-local-server/issues"
+  },
+  "homepage": "https://github.com/dedydantry/react-native-local-server#readme",
+  "author": "",
+  "license": "ISC",
+  "peerDependencies": {
+    "react": "*",
+    "react-native": "*"
+  },
+  "files": [
+    "index.js",
+    "ios/",
+    "android/src/",
+    "android/build.gradle",
+    "react-native-local-server.podspec",
+    "react-native.config.js",
+    "README.md"
+  ]
+}
