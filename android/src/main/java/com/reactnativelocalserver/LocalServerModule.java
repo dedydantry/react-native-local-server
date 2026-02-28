@@ -34,6 +34,10 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Pure Java socket-based HTTP static file server for React Native Android.
@@ -45,14 +49,20 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
     private static final String TAG = "LocalServer";
     private static final int CHUNK_SIZE = 256 * 1024; // 256KB
     private static final int HEADER_BUFFER_SIZE = 8192; // 8KB
+    private static final int MAX_CONCURRENT_CONNECTIONS = 64;
+    private static final int LISTEN_BACKLOG = 1024;
+    private static final int KEEPALIVE_TIMEOUT = 15; // seconds
+    private static final int KEEPALIVE_MAX_REQUESTS = 100; // max requests per connection
 
     private ServerSocket serverSocket;
     private String rootPath;
     private int port;
     private boolean isServerRunning = false;
     private String serverURL;
+    private String pingMessage = "pong";
     private ExecutorService executor;
     private Thread acceptThread;
+    private Semaphore connectionSemaphore;
 
     private static final Map<String, String> MIME_TYPES = new HashMap<>();
 
@@ -163,12 +173,17 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
     // -------------------------------------------------------------------------
 
     private String buildHTTPHeaders(int statusCode, String statusText, String contentType,
-                                     long contentLength, Map<String, String> extraHeaders) {
+                                     long contentLength, Map<String, String> extraHeaders, boolean keepAlive) {
         StringBuilder sb = new StringBuilder();
         sb.append("HTTP/1.1 ").append(statusCode).append(" ").append(statusText).append("\r\n");
         sb.append("Content-Type: ").append(contentType).append("\r\n");
         sb.append("Content-Length: ").append(contentLength).append("\r\n");
-        sb.append("Connection: close\r\n");
+        if (keepAlive) {
+            sb.append("Connection: keep-alive\r\n");
+            sb.append("Keep-Alive: timeout=").append(KEEPALIVE_TIMEOUT).append(", max=").append(KEEPALIVE_MAX_REQUESTS).append("\r\n");
+        } else {
+            sb.append("Connection: close\r\n");
+        }
         sb.append("Access-Control-Allow-Origin: *\r\n");
         sb.append("Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n");
         sb.append("Access-Control-Allow-Headers: *\r\n");
@@ -195,32 +210,32 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
     }
 
     private void sendHTTPResponse(OutputStream out, int statusCode, String statusText,
-                                   String contentType, byte[] body, Map<String, String> extraHeaders) {
-        String headers = buildHTTPHeaders(statusCode, statusText, contentType, body.length, extraHeaders);
+                                   String contentType, byte[] body, Map<String, String> extraHeaders, boolean keepAlive) {
+        String headers = buildHTTPHeaders(statusCode, statusText, contentType, body.length, extraHeaders, keepAlive);
         sendData(out, headers.getBytes(StandardCharsets.UTF_8));
         sendData(out, body);
     }
 
-    private void send404(OutputStream out) {
+    private void send404(OutputStream out, boolean keepAlive) {
         String body = "<html><body><h1>404 Not Found</h1></body></html>";
-        sendHTTPResponse(out, 404, "Not Found", "text/html", body.getBytes(StandardCharsets.UTF_8), null);
+        sendHTTPResponse(out, 404, "Not Found", "text/html", body.getBytes(StandardCharsets.UTF_8), null, keepAlive);
     }
 
     // -------------------------------------------------------------------------
     // File Streaming
     // -------------------------------------------------------------------------
 
-    private void sendFile(OutputStream out, File file) {
+    private void sendFile(OutputStream out, File file, boolean keepAlive) {
         long fileSize = file.length();
         if (fileSize == 0) {
-            send404(out);
+            send404(out, keepAlive);
             return;
         }
 
         String mimeType = getMimeType(file.getName());
 
         // Send headers first
-        String headers = buildHTTPHeaders(200, "OK", mimeType, fileSize, null);
+        String headers = buildHTTPHeaders(200, "OK", mimeType, fileSize, null, keepAlive);
         if (!sendData(out, headers.getBytes(StandardCharsets.UTF_8))) return;
 
         // Stream file in chunks (256KB)
@@ -240,7 +255,7 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
         }
     }
 
-    private void sendFileWithDisposition(OutputStream out, File file) {
+    private void sendFileWithDisposition(OutputStream out, File file, boolean keepAlive) {
         long fileSize = file.length();
         String mimeType = getMimeType(file.getName());
         String fileName = file.getName();
@@ -255,7 +270,7 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
         extraHeaders.put("Content-Disposition",
                 "attachment; filename=\"" + fileName + "\"; filename*=UTF-8''" + encodedName);
 
-        String headers = buildHTTPHeaders(200, "OK", mimeType, fileSize, extraHeaders);
+        String headers = buildHTTPHeaders(200, "OK", mimeType, fileSize, extraHeaders, keepAlive);
         if (!sendData(out, headers.getBytes(StandardCharsets.UTF_8))) return;
 
         // Stream
@@ -496,107 +511,170 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
     }
 
     // -------------------------------------------------------------------------
-    // Connection Handler
+    // Connection Handler (with HTTP Keep-Alive)
     // -------------------------------------------------------------------------
 
     private void handleConnection(Socket clientSocket) {
+        boolean acquired = false;
         try {
-            clientSocket.setSoTimeout(30000); // 30s read timeout
+            // Semaphore-gated: limit concurrent connections
+            acquired = connectionSemaphore.tryAcquire(5, TimeUnit.SECONDS);
+            if (!acquired) {
+                // Server overloaded — send 503 and close
+                try {
+                    OutputStream out = clientSocket.getOutputStream();
+                    String resp = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    out.write(resp.getBytes(StandardCharsets.UTF_8));
+                    out.flush();
+                } catch (IOException ignored) {}
+                return;
+            }
+
+            clientSocket.setSoTimeout(30000); // 30s read timeout for first request
+            clientSocket.setTcpNoDelay(true);  // Disable Nagle for lower latency
 
             InputStream in = clientSocket.getInputStream();
             OutputStream out = clientSocket.getOutputStream();
 
-            // Read request headers (8KB buffer)
-            byte[] buffer = new byte[HEADER_BUFFER_SIZE];
-            int bytesRead = in.read(buffer);
-            if (bytesRead <= 0) return;
+            int requestCount = 0;
+            boolean keepAlive = true;
 
-            String requestStr = new String(buffer, 0, bytesRead, StandardCharsets.UTF_8);
-            String[] lines = requestStr.split("\r\n");
-            String requestLine = lines.length > 0 ? lines[0] : "";
+            // Keep-Alive loop: handle multiple requests on the same connection
+            while (keepAlive && requestCount < KEEPALIVE_MAX_REQUESTS && isServerRunning) {
 
-            String requestPath = parseRequestPath(requestLine);
-            Log.i(TAG, "Request: " + requestPath);
-
-            // --- API Route: /api/files → returns all files as JSON (recursive) ---
-            if ("/api/files".equals(requestPath) || "/api/files/".equals(requestPath)) {
-                byte[] jsonData = buildFilesJSONResponse();
-                sendHTTPResponse(out, 200, "OK", "application/json; charset=utf-8", jsonData, null);
-                return;
-            }
-
-            // --- API Route: /api/dir or /api/dir/<path> → list directory contents (non-recursive) ---
-            if ("/api/dir".equals(requestPath) || "/api/dir/".equals(requestPath)) {
-                byte[] jsonData = buildDirectoryJSONForPath("/");
-                sendHTTPResponse(out, 200, "OK", "application/json; charset=utf-8", jsonData, null);
-                return;
-            }
-            if (requestPath.startsWith("/api/dir/")) {
-                String dirSubPath = requestPath.substring(9); // length of "/api/dir/"
-                try {
-                    dirSubPath = URLDecoder.decode(dirSubPath, "UTF-8");
-                } catch (Exception ignored) {}
-                byte[] jsonData = buildDirectoryJSONForPath(dirSubPath);
-                sendHTTPResponse(out, 200, "OK", "application/json; charset=utf-8", jsonData, null);
-                return;
-            }
-
-            // --- Download Route: /download/<path> → force download with Content-Disposition ---
-            if (requestPath.startsWith("/download/")) {
-                String dlRelativePath = requestPath.substring(10); // length of "/download/"
-                try {
-                    dlRelativePath = URLDecoder.decode(dlRelativePath, "UTF-8");
-                } catch (Exception ignored) {}
-
-                // Sanitize
-                if (dlRelativePath.contains("..") || dlRelativePath.isEmpty()) {
-                    send404(out);
-                    return;
+                // For subsequent requests, use shorter timeout (keep-alive idle timeout)
+                if (requestCount > 0) {
+                    clientSocket.setSoTimeout(KEEPALIVE_TIMEOUT * 1000);
                 }
 
-                File downloadFile = new File(rootPath, dlRelativePath);
-                if (!downloadFile.exists() || downloadFile.isDirectory()) {
-                    send404(out);
-                    return;
+                // Read request headers (8KB buffer)
+                byte[] buffer = new byte[HEADER_BUFFER_SIZE];
+                int bytesRead = in.read(buffer);
+                if (bytesRead <= 0) break; // Client closed or timeout
+
+                requestCount++;
+
+                String requestStr = new String(buffer, 0, bytesRead, StandardCharsets.UTF_8);
+                String[] lines = requestStr.split("\r\n");
+                String requestLine = lines.length > 0 ? lines[0] : "";
+
+                String requestPath = parseRequestPath(requestLine);
+                Log.i(TAG, "Request #" + requestCount + ": " + requestPath);
+
+                // Extract HTTP method
+                String httpMethod = "GET";
+                String[] requestParts = requestLine.split(" ");
+                if (requestParts.length > 0) {
+                    httpMethod = requestParts[0].toUpperCase();
                 }
 
-                sendFileWithDisposition(out, downloadFile);
-                return;
-            }
+                // Check Connection header from client (HTTP/1.1 defaults to keep-alive)
+                boolean clientWantsKeepAlive = true; // HTTP/1.1 default
+                for (String line : lines) {
+                    if (line.toLowerCase().startsWith("connection:")) {
+                        String val = line.substring(11).trim().toLowerCase();
+                        clientWantsKeepAlive = !"close".equals(val);
+                        break;
+                    }
+                }
+                keepAlive = clientWantsKeepAlive && (requestCount < KEEPALIVE_MAX_REQUESTS);
 
-            // Sanitize path to prevent directory traversal
-            if (requestPath.contains("..")) {
-                requestPath = "/";
-            }
+                // Handle OPTIONS preflight (CORS pre-flight check)
+                if ("OPTIONS".equals(httpMethod)) {
+                    sendHTTPResponse(out, 204, "No Content", "text/plain", new byte[0], null, keepAlive);
+                    continue;
+                }
 
-            // Build full file path
-            File fullPath;
-            if ("/".equals(requestPath)) {
-                fullPath = new File(rootPath);
-            } else {
-                String relativePath = requestPath.startsWith("/") ? requestPath.substring(1) : requestPath;
-                fullPath = new File(rootPath, relativePath);
-            }
+                // --- API Route: /ping → health check ---
+                if ("/ping".equals(requestPath) || "/ping/".equals(requestPath)) {
+                    byte[] pingBody = ("{\"status\":true,\"message\":\"" + pingMessage + "\"}").getBytes(StandardCharsets.UTF_8);
+                    sendHTTPResponse(out, 200, "OK", "application/json; charset=utf-8", pingBody, null, keepAlive);
+                    continue;
+                }
 
-            if (!fullPath.exists()) {
-                send404(out);
-            } else if (fullPath.isDirectory()) {
-                // Check for index.html
-                File indexFile = new File(fullPath, "index.html");
-                if (indexFile.exists()) {
-                    sendFile(out, indexFile);
+                // --- API Route: /api/files → returns all files as JSON (recursive) ---
+                if ("/api/files".equals(requestPath) || "/api/files/".equals(requestPath)) {
+                    byte[] jsonData = buildFilesJSONResponse();
+                    sendHTTPResponse(out, 200, "OK", "application/json; charset=utf-8", jsonData, null, keepAlive);
+                    continue;
+                }
+
+                // --- API Route: /api/dir or /api/dir/<path> → list directory contents (non-recursive) ---
+                if ("/api/dir".equals(requestPath) || "/api/dir/".equals(requestPath)) {
+                    byte[] jsonData = buildDirectoryJSONForPath("/");
+                    sendHTTPResponse(out, 200, "OK", "application/json; charset=utf-8", jsonData, null, keepAlive);
+                    continue;
+                }
+                if (requestPath.startsWith("/api/dir/")) {
+                    String dirSubPath = requestPath.substring(9); // length of "/api/dir/"
+                    try {
+                        dirSubPath = URLDecoder.decode(dirSubPath, "UTF-8");
+                    } catch (Exception ignored) {}
+                    byte[] jsonData = buildDirectoryJSONForPath(dirSubPath);
+                    sendHTTPResponse(out, 200, "OK", "application/json; charset=utf-8", jsonData, null, keepAlive);
+                    continue;
+                }
+
+                // --- Download Route: /download/<path> → force download with Content-Disposition ---
+                if (requestPath.startsWith("/download/")) {
+                    String dlRelativePath = requestPath.substring(10); // length of "/download/"
+                    try {
+                        dlRelativePath = URLDecoder.decode(dlRelativePath, "UTF-8");
+                    } catch (Exception ignored) {}
+
+                    // Sanitize
+                    if (dlRelativePath.contains("..") || dlRelativePath.isEmpty()) {
+                        send404(out, keepAlive);
+                        continue;
+                    }
+
+                    File downloadFile = new File(rootPath, dlRelativePath);
+                    if (!downloadFile.exists() || downloadFile.isDirectory()) {
+                        send404(out, keepAlive);
+                        continue;
+                    }
+
+                    sendFileWithDisposition(out, downloadFile, keepAlive);
+                    continue;
+                }
+
+                // Sanitize path to prevent directory traversal
+                if (requestPath.contains("..")) {
+                    requestPath = "/";
+                }
+
+                // Build full file path
+                File fullPath;
+                if ("/".equals(requestPath)) {
+                    fullPath = new File(rootPath);
                 } else {
-                    byte[] listing = buildDirectoryListingResponse(fullPath, requestPath);
-                    sendHTTPResponse(out, 200, "OK", "text/html; charset=utf-8", listing, null);
+                    String relativePath = requestPath.startsWith("/") ? requestPath.substring(1) : requestPath;
+                    fullPath = new File(rootPath, relativePath);
                 }
-            } else {
-                // Stream file in chunks — handles large images/videos
-                sendFile(out, fullPath);
-            }
 
-        } catch (IOException e) {
+                if (!fullPath.exists()) {
+                    send404(out, keepAlive);
+                } else if (fullPath.isDirectory()) {
+                    // Check for index.html
+                    File indexFile = new File(fullPath, "index.html");
+                    if (indexFile.exists()) {
+                        sendFile(out, indexFile, keepAlive);
+                    } else {
+                        byte[] listing = buildDirectoryListingResponse(fullPath, requestPath);
+                        sendHTTPResponse(out, 200, "OK", "text/html; charset=utf-8", listing, null, keepAlive);
+                    }
+                } else {
+                    // Stream file in chunks — handles large images/videos
+                    sendFile(out, fullPath, keepAlive);
+                }
+            } // end while keep-alive loop
+
+        } catch (IOException | InterruptedException e) {
             Log.e(TAG, "Error handling connection", e);
         } finally {
+            if (acquired) {
+                connectionSemaphore.release();
+            }
             try {
                 clientSocket.close();
             } catch (IOException ignored) {}
@@ -608,11 +686,23 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
     // -------------------------------------------------------------------------
 
     @ReactMethod
-    public void start(double portNumber, String root, boolean localOnly, Promise promise) {
-        if (isServerRunning) {
-            promise.resolve(serverURL);
-            return;
+    public void start(double portNumber, String root, boolean localOnly, String pingMessage, Promise promise) {
+        // If already running, verify and return
+        if (isServerRunning && serverSocket != null && !serverSocket.isClosed()) {
+            try {
+                // Quick health check — try to verify socket is alive
+                if (serverSocket.isBound() && serverURL != null) {
+                    promise.resolve(serverURL);
+                    return;
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Server appears dead, cleaning up before restart: " + e.getMessage());
+            }
+            forceCleanup();
         }
+
+        // Force cleanup any lingering state (previous server that wasn't stopped cleanly)
+        forceCleanup();
 
         // Normalize root path — remove file:// prefix if present
         String normalizedRoot = root;
@@ -633,19 +723,27 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
             this.rootPath = this.rootPath.substring(0, this.rootPath.length() - 1);
         }
         this.port = (int) portNumber;
+        this.pingMessage = (pingMessage != null && !pingMessage.isEmpty()) ? pingMessage : "pong";
 
         try {
             serverSocket = new ServerSocket();
             serverSocket.setReuseAddress(true);
 
             if (localOnly) {
-                serverSocket.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), this.port), 128);
+                serverSocket.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), this.port), LISTEN_BACKLOG);
             } else {
-                serverSocket.bind(new InetSocketAddress(this.port), 128);
+                serverSocket.bind(new InetSocketAddress(this.port), LISTEN_BACKLOG);
             }
 
-            // Create thread pool for handling connections
-            executor = Executors.newCachedThreadPool();
+            // Bounded thread pool: core=16, max=MAX_CONCURRENT_CONNECTIONS, queue=1024
+            // Prevents OOM from unbounded thread creation under heavy load
+            connectionSemaphore = new Semaphore(MAX_CONCURRENT_CONNECTIONS);
+            executor = new ThreadPoolExecutor(
+                16,                           // core pool size
+                MAX_CONCURRENT_CONNECTIONS,    // max pool size
+                60L, TimeUnit.SECONDS,         // idle thread keepalive
+                new LinkedBlockingQueue<>(LISTEN_BACKLOG)  // work queue
+            );
 
             // Accept thread
             acceptThread = new Thread(() -> {
@@ -674,50 +772,66 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
             promise.resolve(serverURL);
 
         } catch (IOException e) {
+            forceCleanup();
             promise.reject("START_ERROR", "Failed to start server: " + e.getMessage(), e);
         }
     }
 
     @ReactMethod
     public void stop(Promise promise) {
-        if (!isServerRunning) {
-            promise.resolve(true);
-            return;
-        }
-
-        try {
-            if (acceptThread != null) {
-                acceptThread.interrupt();
-                acceptThread = null;
-            }
-
-            if (serverSocket != null && !serverSocket.isClosed()) {
-                serverSocket.close();
-                serverSocket = null;
-            }
-
-            if (executor != null) {
-                executor.shutdownNow();
-                executor = null;
-            }
-
-            isServerRunning = false;
-            serverURL = null;
-
-            Log.i(TAG, "Stopped");
-            promise.resolve(true);
-        } catch (IOException e) {
-            promise.reject("STOP_ERROR", "Failed to stop server: " + e.getMessage(), e);
-        }
+        forceCleanup();
+        Log.i(TAG, "Stopped");
+        promise.resolve(true);
     }
 
     @ReactMethod
     public void isRunning(Promise promise) {
+        // Verify actual socket health, not just the flag
+        if (isServerRunning) {
+            if (serverSocket == null || serverSocket.isClosed()) {
+                forceCleanup();
+                promise.resolve(false);
+                return;
+            }
+        }
         promise.resolve(isServerRunning);
     }
 
     @ReactMethod
     public void getIPAddress(Promise promise) {
         promise.resolve(getWiFiIPAddress());
+    }
+
+    /**
+     * Force cleanup all server resources — safe to call multiple times.
+     * Closes socket FIRST to unblock the accept thread, then interrupts.
+     */
+    private void forceCleanup() {
+        isServerRunning = false;
+        serverURL = null;
+
+        // Close socket FIRST — this unblocks accept() immediately
+        if (serverSocket != null) {
+            try {
+                if (!serverSocket.isClosed()) {
+                    serverSocket.close();
+                }
+            } catch (IOException e) {
+                Log.w(TAG, "Error closing server socket: " + e.getMessage());
+            }
+            serverSocket = null;
+        }
+
+        // Then interrupt and dereference accept thread
+        if (acceptThread != null) {
+            acceptThread.interrupt();
+            acceptThread = null;
+        }
+
+        // Shutdown executor — active connection handlers get interrupted
+        if (executor != null) {
+            executor.shutdownNow();
+            executor = null;
+        }
     }
 }

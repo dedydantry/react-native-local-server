@@ -4,9 +4,18 @@
 #import <arpa/inet.h>
 #import <net/if.h>
 #import <sys/socket.h>
+#import <netinet/tcp.h>  // Add this for TCP_NODELAY
 
 // Pure BSD socket-based HTTP static file server
 // Streams large files in chunks to handle images/videos of any size
+
+#define MAX_CONCURRENT_CONNECTIONS 64
+#define LISTEN_BACKLOG 1024
+#define KEEPALIVE_TIMEOUT 30  // increased from 15
+#define KEEPALIVE_MAX_REQUESTS 100
+#define CHUNK_SIZE (128 * 1024)  // 512KB chunks for better throughput
+#define SEND_BUFFER_SIZE (1024 * 1024)  // 1MB send buffer
+#define RECV_BUFFER_SIZE (64 * 1024)    // 64KB recv buffer
 
 @interface LocalServer ()
 @property (nonatomic, strong) dispatch_source_t serverSource;
@@ -15,7 +24,9 @@
 @property (nonatomic, assign) NSInteger port;
 @property (nonatomic, assign) BOOL isServerRunning;
 @property (nonatomic, strong) NSString *serverURL;
+@property (nonatomic, strong) NSString *pingMessage;
 @property (nonatomic, strong) dispatch_queue_t serverQueue;
+@property (nonatomic, assign) dispatch_semaphore_t connectionSemaphore;
 @end
 
 @implementation LocalServer
@@ -28,6 +39,7 @@ RCT_EXPORT_MODULE()
         _serverSocket = -1;
         _isServerRunning = NO;
         _serverQueue = dispatch_queue_create("com.localserver.queue", DISPATCH_QUEUE_CONCURRENT);
+        _connectionSemaphore = dispatch_semaphore_create(MAX_CONCURRENT_CONNECTIONS);
     }
     return self;
 }
@@ -127,13 +139,19 @@ RCT_EXPORT_MODULE()
                   statusText:(NSString *)statusText
                  contentType:(NSString *)contentType
                contentLength:(unsigned long long)contentLength
-                extraHeaders:(NSDictionary *)extraHeaders {
+                extraHeaders:(NSDictionary *)extraHeaders
+                   keepAlive:(BOOL)keepAlive {
     
     NSMutableString *header = [NSMutableString string];
     [header appendFormat:@"HTTP/1.1 %ld %@\r\n", (long)statusCode, statusText];
     [header appendFormat:@"Content-Type: %@\r\n", contentType];
     [header appendFormat:@"Content-Length: %llu\r\n", contentLength];
-    [header appendString:@"Connection: close\r\n"];
+    if (keepAlive) {
+        [header appendString:@"Connection: keep-alive\r\n"];
+        [header appendFormat:@"Keep-Alive: timeout=%d, max=%d\r\n", KEEPALIVE_TIMEOUT, KEEPALIVE_MAX_REQUESTS];
+    } else {
+        [header appendString:@"Connection: close\r\n"];
+    }
     [header appendString:@"Access-Control-Allow-Origin: *\r\n"];
     [header appendString:@"Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n"];
     [header appendString:@"Access-Control-Allow-Headers: *\r\n"];
@@ -154,21 +172,30 @@ RCT_EXPORT_MODULE()
     const uint8_t *bytes = (const uint8_t *)[data bytes];
     NSUInteger remaining = [data length];
     NSUInteger offset = 0;
+    int retryCount = 0;
+    const int maxRetries = 100;  // Max retries for EAGAIN
     
     while (remaining > 0) {
         ssize_t sent = send(sock, bytes + offset, remaining, 0);
         if (sent > 0) {
             offset += sent;
             remaining -= sent;
+            retryCount = 0;  // Reset retry counter on success
         } else if (sent == -1) {
             if (errno == EINTR) {
-                continue; // Interrupted, retry
+                continue; // Interrupted, retry immediately
             } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // Socket buffer full, wait a bit and retry
-                usleep(1000); // 1ms
+                retryCount++;
+                if (retryCount >= maxRetries) {
+                    RCTLogInfo(@"[LocalServer] Send timeout after %d retries", retryCount);
+                    return NO;
+                }
+                // Socket buffer full, wait with exponential backoff
+                usleep(1000 * MIN(retryCount, 10)); // 1ms to 10ms
                 continue;
             } else {
                 // Real error (EPIPE, ECONNRESET, etc.)
+                RCTLogInfo(@"[LocalServer] Send error: %s (errno=%d)", strerror(errno), errno);
                 return NO;
             }
         } else {
@@ -183,66 +210,101 @@ RCT_EXPORT_MODULE()
              contentType:(NSString *)contentType
                     body:(NSData *)body
             extraHeaders:(NSDictionary *)extraHeaders
-                toSocket:(int)sock {
+                toSocket:(int)sock
+               keepAlive:(BOOL)keepAlive {
     
     NSData *headers = [self buildHTTPHeaders:statusCode
                                  statusText:statusText
                                 contentType:contentType
                               contentLength:body.length
-                               extraHeaders:extraHeaders];
+                               extraHeaders:extraHeaders
+                                  keepAlive:keepAlive];
     [self sendData:headers toSocket:sock];
     [self sendData:body toSocket:sock];
 }
 
-- (void)send404ToSocket:(int)sock {
+- (void)send404ToSocket:(int)sock keepAlive:(BOOL)keepAlive {
     NSString *body = @"<html><body><h1>404 Not Found</h1></body></html>";
     NSData *bodyData = [body dataUsingEncoding:NSUTF8StringEncoding];
-    [self sendHTTPResponse:404 statusText:@"Not Found" contentType:@"text/html" body:bodyData extraHeaders:nil toSocket:sock];
+    [self sendHTTPResponse:404 statusText:@"Not Found" contentType:@"text/html" body:bodyData extraHeaders:nil toSocket:sock keepAlive:keepAlive];
 }
 
-- (void)sendFileAtPath:(NSString *)filePath toSocket:(int)sock {
+- (void)sendFileAtPath:(NSString *)filePath toSocket:(int)sock keepAlive:(BOOL)keepAlive {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSDictionary *attrs = [fm attributesOfItemAtPath:filePath error:nil];
     unsigned long long fileSize = [attrs fileSize];
     
     if (fileSize == 0) {
-        [self send404ToSocket:sock];
+        [self send404ToSocket:sock keepAlive:keepAlive];
         return;
     }
     
     NSString *mimeType = [self mimeTypeForPath:filePath];
+    
+    // For large files (>1MB), add Accept-Ranges header for potential resume support
+    NSMutableDictionary *extraHeaders = [NSMutableDictionary dictionary];
+    if (fileSize > 1024 * 1024) {
+        extraHeaders[@"Accept-Ranges"] = @"bytes";
+    }
     
     // Send headers first
     NSData *headers = [self buildHTTPHeaders:200
                                  statusText:@"OK"
                                 contentType:mimeType
                               contentLength:fileSize
-                               extraHeaders:nil];
+                               extraHeaders:extraHeaders.count > 0 ? extraHeaders : nil
+                                  keepAlive:keepAlive];
     if (![self sendData:headers toSocket:sock]) {
+        RCTLogInfo(@"[LocalServer] Failed to send headers for %@", filePath);
         return;
     }
     
-    // Stream file in chunks (256KB per chunk)
-    static const NSUInteger CHUNK_SIZE = 256 * 1024;
-    
-    NSFileHandle *fileHandle = [NSFileHandle fileHandleForReadingAtPath:filePath];
-    if (!fileHandle) {
+    // Use file descriptor for more efficient reading (avoids NSFileHandle overhead)
+    int fd = open([filePath fileSystemRepresentation], O_RDONLY);
+    if (fd < 0) {
+        RCTLogInfo(@"[LocalServer] Failed to open file: %@", filePath);
         return;
     }
     
-    @try {
-        while (YES) {
-            @autoreleasepool {
-                NSData *chunk = [fileHandle readDataOfLength:CHUNK_SIZE];
-                if (chunk.length == 0) break; // EOF
-                
-                if (![self sendData:chunk toSocket:sock]) {
-                    break; // Send failed, client disconnected
+    // Advise kernel we'll read sequentially
+    fcntl(fd, F_RDAHEAD, 1);
+    
+    // Stream file in large chunks
+    uint8_t *buffer = malloc(CHUNK_SIZE);
+    if (!buffer) {
+        close(fd);
+        return;
+    }
+    
+    unsigned long long totalSent = 0;
+    BOOL success = YES;
+    
+    while (totalSent < fileSize) {
+        @autoreleasepool {
+            ssize_t bytesRead = read(fd, buffer, CHUNK_SIZE);
+            if (bytesRead <= 0) {
+                if (bytesRead < 0) {
+                    RCTLogInfo(@"[LocalServer] Read error: %s", strerror(errno));
                 }
+                break; // EOF or error
             }
+            
+            NSData *chunk = [NSData dataWithBytesNoCopy:buffer length:bytesRead freeWhenDone:NO];
+            if (![self sendData:chunk toSocket:sock]) {
+                RCTLogInfo(@"[LocalServer] Send failed at %llu/%llu bytes", totalSent, fileSize);
+                success = NO;
+                break;
+            }
+            
+            totalSent += bytesRead;
         }
-    } @finally {
-        [fileHandle closeFile];
+    }
+    
+    free(buffer);
+    close(fd);
+    
+    if (success && totalSent == fileSize) {
+        RCTLogInfo(@"[LocalServer] Sent %llu bytes for %@", totalSent, [filePath lastPathComponent]);
     }
 }
 
@@ -498,141 +560,222 @@ RCT_EXPORT_MODULE()
     int nosigpipe = 1;
     setsockopt(clientSocket, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof(nosigpipe));
     
-    // Set send/receive timeouts (30 seconds)
+    // Enable TCP_NODELAY for low latency (disable Nagle's algorithm)
+    int nodelay = 1;
+    setsockopt(clientSocket, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+    
+    // Increase send buffer for large file transfers
+    int sendBufSize = SEND_BUFFER_SIZE;
+    setsockopt(clientSocket, SOL_SOCKET, SO_SNDBUF, &sendBufSize, sizeof(sendBufSize));
+    
+    // Increase recv buffer
+    int recvBufSize = RECV_BUFFER_SIZE;
+    setsockopt(clientSocket, SOL_SOCKET, SO_RCVBUF, &recvBufSize, sizeof(recvBufSize));
+    
+    // Set send/receive timeouts (60 seconds for large files)
     struct timeval timeout;
-    timeout.tv_sec = 30;
+    timeout.tv_sec = 60;  // increased from 30
     timeout.tv_usec = 0;
     setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
     setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     
-    // Read request (8KB buffer for headers)
-    char buffer[8192];
-    ssize_t bytesRead = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
-    if (bytesRead <= 0) {
-        close(clientSocket);
-        return;
-    }
-    buffer[bytesRead] = '\0';
-    NSData *requestData = [NSData dataWithBytes:buffer length:bytesRead];
+    // Enable TCP keep-alive to detect dead connections
+    int keepAliveOn = 1;
+    setsockopt(clientSocket, SOL_SOCKET, SO_KEEPALIVE, &keepAliveOn, sizeof(keepAliveOn));
     
-    NSString *requestPath = [self parseRequestPath:requestData];
-    RCTLogInfo(@"[LocalServer] Request: %@", requestPath);
+    int requestCount = 0;
+    BOOL keepAlive = YES;
     
-    // --- API Route: /api/files → returns all files as JSON (recursive) ---
-    if ([requestPath isEqualToString:@"/api/files"] || [requestPath isEqualToString:@"/api/files/"]) {
-        NSData *jsonData = [self buildFilesJSONResponse];
-        [self sendHTTPResponse:200 statusText:@"OK" contentType:@"application/json; charset=utf-8" body:jsonData extraHeaders:nil toSocket:clientSocket];
-        close(clientSocket);
-        return;
-    }
-    
-    // --- API Route: /api/dir or /api/dir/<path> → list directory contents (non-recursive) ---
-    if ([requestPath isEqualToString:@"/api/dir"] || [requestPath isEqualToString:@"/api/dir/"]) {
-        NSData *jsonData = [self buildDirectoryJSONForPath:@"/"];
-        [self sendHTTPResponse:200 statusText:@"OK" contentType:@"application/json; charset=utf-8" body:jsonData extraHeaders:nil toSocket:clientSocket];
-        close(clientSocket);
-        return;
-    }
-    if ([requestPath hasPrefix:@"/api/dir/"]) {
-        NSString *dirSubPath = [requestPath substringFromIndex:9]; // length of "/api/dir/"
-        dirSubPath = [dirSubPath stringByRemovingPercentEncoding];
-        NSData *jsonData = [self buildDirectoryJSONForPath:dirSubPath];
-        [self sendHTTPResponse:200 statusText:@"OK" contentType:@"application/json; charset=utf-8" body:jsonData extraHeaders:nil toSocket:clientSocket];
-        close(clientSocket);
-        return;
-    }
-    
-    // --- Download Route: /download/<path> → force download with Content-Disposition ---
-    if ([requestPath hasPrefix:@"/download/"]) {
-        NSString *dlRelativePath = [requestPath substringFromIndex:10]; // length of "/download/"
-        dlRelativePath = [dlRelativePath stringByRemovingPercentEncoding];
-        dlRelativePath = [dlRelativePath stringByStandardizingPath];
-        if ([dlRelativePath hasPrefix:@".."] || [dlRelativePath length] == 0) {
-            [self send404ToSocket:clientSocket];
-            close(clientSocket);
-            return;
+    // Keep-Alive loop: handle multiple requests on the same connection
+    while (keepAlive && requestCount < KEEPALIVE_MAX_REQUESTS && self.isServerRunning) {
+        
+        // For subsequent requests, use shorter recv timeout (keep-alive idle timeout)
+        if (requestCount > 0) {
+            struct timeval kaTimeout;
+            kaTimeout.tv_sec = KEEPALIVE_TIMEOUT;
+            kaTimeout.tv_usec = 0;
+            setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &kaTimeout, sizeof(kaTimeout));
         }
-        NSString *downloadPath = [self.rootPath stringByAppendingPathComponent:dlRelativePath];
-        NSFileManager *dlFm = [NSFileManager defaultManager];
-        BOOL dlIsDir = NO;
-        if (![dlFm fileExistsAtPath:downloadPath isDirectory:&dlIsDir] || dlIsDir) {
-            [self send404ToSocket:clientSocket];
-            close(clientSocket);
-            return;
+        
+        // Read request (8KB buffer for headers)
+        char buffer[8192];
+        ssize_t bytesRead = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
+        if (bytesRead <= 0) {
+            break; // Client closed or timeout — exit loop
         }
-        // Send file with Content-Disposition: attachment for forced download
-        NSDictionary *dlAttrs = [dlFm attributesOfItemAtPath:downloadPath error:nil];
-        unsigned long long dlFileSize = [dlAttrs fileSize];
-        NSString *dlMimeType = [self mimeTypeForPath:downloadPath];
-        NSString *dlFileName = [downloadPath lastPathComponent];
-        NSString *dlEncodedName = [dlFileName stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLPathAllowedCharacterSet]];
-        NSDictionary *dlExtraHeaders = @{
-            @"Content-Disposition": [NSString stringWithFormat:@"attachment; filename=\"%@\"; filename*=UTF-8''%@", dlFileName, dlEncodedName]
-        };
-        NSData *dlHeaders = [self buildHTTPHeaders:200
-                                        statusText:@"OK"
-                                       contentType:dlMimeType
-                                     contentLength:dlFileSize
-                                      extraHeaders:dlExtraHeaders];
-        if (![self sendData:dlHeaders toSocket:clientSocket]) {
-            close(clientSocket);
-            return;
-        }
-        // Stream file in chunks
-        static const NSUInteger DL_CHUNK = 256 * 1024;
-        NSFileHandle *dlHandle = [NSFileHandle fileHandleForReadingAtPath:downloadPath];
-        if (dlHandle) {
-            @try {
-                while (YES) {
-                    @autoreleasepool {
-                        NSData *chunk = [dlHandle readDataOfLength:DL_CHUNK];
-                        if (chunk.length == 0) break;
-                        if (![self sendData:chunk toSocket:clientSocket]) break;
-                    }
-                }
-            } @finally {
-                [dlHandle closeFile];
+        buffer[bytesRead] = '\0';
+        requestCount++;
+        
+        NSData *requestData = [NSData dataWithBytes:buffer length:bytesRead];
+        NSString *requestPath = [self parseRequestPath:requestData];
+        RCTLogInfo(@"[LocalServer] Request #%d: %@", requestCount, requestPath);
+        
+        // Extract HTTP method and headers
+        NSString *requestStr = [[NSString alloc] initWithBytes:buffer length:bytesRead encoding:NSUTF8StringEncoding];
+        NSArray *requestLines = [requestStr componentsSeparatedByString:@"\r\n"];
+        NSString *firstLine = requestLines.count > 0 ? requestLines[0] : @"";
+        NSArray *firstLineParts = [firstLine componentsSeparatedByString:@" "];
+        NSString *httpMethod = firstLineParts.count > 0 ? [firstLineParts[0] uppercaseString] : @"GET";
+        
+        // Check Connection header from client (HTTP/1.1 defaults to keep-alive)
+        BOOL clientWantsKeepAlive = YES; // HTTP/1.1 default
+        for (NSString *line in requestLines) {
+            if ([[line lowercaseString] hasPrefix:@"connection:"]) {
+                NSString *val = [[line substringFromIndex:11] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+                clientWantsKeepAlive = ![[val lowercaseString] isEqualToString:@"close"];
+                break;
             }
         }
-        close(clientSocket);
-        return;
-    }
-    
-    // Sanitize path to prevent directory traversal
-    requestPath = [requestPath stringByStandardizingPath];
-    if ([requestPath hasPrefix:@".."]) {
-        requestPath = @"/";
-    }
-    
-    // Build full file path
-    NSString *fullPath;
-    if ([requestPath isEqualToString:@"/"]) {
-        fullPath = self.rootPath;
-    } else {
-        // Remove leading slash
-        NSString *relativePath = [requestPath substringFromIndex:1];
-        fullPath = [self.rootPath stringByAppendingPathComponent:relativePath];
-    }
-    
-    NSFileManager *fm = [NSFileManager defaultManager];
-    BOOL isDir = NO;
-    BOOL exists = [fm fileExistsAtPath:fullPath isDirectory:&isDir];
-    
-    if (!exists) {
-        [self send404ToSocket:clientSocket];
-    } else if (isDir) {
-        // Check for index.html
-        NSString *indexPath = [fullPath stringByAppendingPathComponent:@"index.html"];
-        if ([fm fileExistsAtPath:indexPath]) {
-            [self sendFileAtPath:indexPath toSocket:clientSocket];
-        } else {
-            NSData *listing = [self buildDirectoryListingResponse:fullPath requestPath:requestPath];
-            [self sendHTTPResponse:200 statusText:@"OK" contentType:@"text/html; charset=utf-8" body:listing extraHeaders:nil toSocket:clientSocket];
+        // Respect client preference; also force close on last allowed request
+        keepAlive = clientWantsKeepAlive && (requestCount < KEEPALIVE_MAX_REQUESTS);
+        
+        // Handle OPTIONS preflight (CORS pre-flight check)
+        if ([httpMethod isEqualToString:@"OPTIONS"]) {
+            NSData *emptyBody = [NSData data];
+            [self sendHTTPResponse:204 statusText:@"No Content" contentType:@"text/plain" body:emptyBody extraHeaders:nil toSocket:clientSocket keepAlive:keepAlive];
+            continue;
         }
-    } else {
-        // Stream file in chunks — handles large images/videos
-        [self sendFileAtPath:fullPath toSocket:clientSocket];
-    }
+        
+        // --- API Route: /ping → health check ---
+        if ([requestPath isEqualToString:@"/ping"] || [requestPath isEqualToString:@"/ping/"]) {
+            NSString *pingJSON = [NSString stringWithFormat:@"{\"status\":true,\"message\":\"%@\"}", self.pingMessage];
+            NSData *pingData = [pingJSON dataUsingEncoding:NSUTF8StringEncoding];
+            [self sendHTTPResponse:200 statusText:@"OK" contentType:@"application/json; charset=utf-8" body:pingData extraHeaders:nil toSocket:clientSocket keepAlive:keepAlive];
+            continue;
+        }
+        
+        // --- API Route: /api/files → returns all files as JSON (recursive) ---
+        if ([requestPath isEqualToString:@"/api/files"] || [requestPath isEqualToString:@"/api/files/"]) {
+            NSData *jsonData = [self buildFilesJSONResponse];
+            [self sendHTTPResponse:200 statusText:@"OK" contentType:@"application/json; charset=utf-8" body:jsonData extraHeaders:nil toSocket:clientSocket keepAlive:keepAlive];
+            continue;
+        }
+        
+        // --- API Route: /api/dir or /api/dir/<path> → list directory contents (non-recursive) ---
+        if ([requestPath isEqualToString:@"/api/dir"] || [requestPath isEqualToString:@"/api/dir/"]) {
+            NSData *jsonData = [self buildDirectoryJSONForPath:@"/"];
+            [self sendHTTPResponse:200 statusText:@"OK" contentType:@"application/json; charset=utf-8" body:jsonData extraHeaders:nil toSocket:clientSocket keepAlive:keepAlive];
+            continue;
+        }
+        if ([requestPath hasPrefix:@"/api/dir/"]) {
+            NSString *dirSubPath = [requestPath substringFromIndex:9]; // length of "/api/dir/"
+            dirSubPath = [dirSubPath stringByRemovingPercentEncoding];
+            NSData *jsonData = [self buildDirectoryJSONForPath:dirSubPath];
+            [self sendHTTPResponse:200 statusText:@"OK" contentType:@"application/json; charset=utf-8" body:jsonData extraHeaders:nil toSocket:clientSocket keepAlive:keepAlive];
+            continue;
+        }
+        
+        // --- Download Route: /download/<path> → force download with Content-Disposition ---
+        if ([requestPath hasPrefix:@"/download/"]) {
+            NSString *dlRelativePath = [requestPath substringFromIndex:10]; // length of "/download/"
+            dlRelativePath = [dlRelativePath stringByRemovingPercentEncoding];
+            dlRelativePath = [dlRelativePath stringByStandardizingPath];
+            if ([dlRelativePath hasPrefix:@".."] || [dlRelativePath length] == 0) {
+                [self send404ToSocket:clientSocket keepAlive:keepAlive];
+                continue;
+            }
+            NSString *downloadPath = [self.rootPath stringByAppendingPathComponent:dlRelativePath];
+            NSFileManager *dlFm = [NSFileManager defaultManager];
+            BOOL dlIsDir = NO;
+            if (![dlFm fileExistsAtPath:downloadPath isDirectory:&dlIsDir] || dlIsDir) {
+                [self send404ToSocket:clientSocket keepAlive:keepAlive];
+                continue;
+            }
+            
+            // Send file with Content-Disposition: attachment for forced download
+            NSDictionary *dlAttrs = [dlFm attributesOfItemAtPath:downloadPath error:nil];
+            unsigned long long dlFileSize = [dlAttrs fileSize];
+            NSString *dlMimeType = [self mimeTypeForPath:downloadPath];
+            NSString *dlFileName = [downloadPath lastPathComponent];
+            NSString *dlEncodedName = [dlFileName stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLPathAllowedCharacterSet]];
+            
+            NSMutableDictionary *dlExtraHeaders = [NSMutableDictionary dictionary];
+            dlExtraHeaders[@"Content-Disposition"] = [NSString stringWithFormat:@"attachment; filename=\"%@\"; filename*=UTF-8''%@", dlFileName, dlEncodedName];
+            if (dlFileSize > 1024 * 1024) {
+                dlExtraHeaders[@"Accept-Ranges"] = @"bytes";
+            }
+            
+            NSData *dlHeaders = [self buildHTTPHeaders:200
+                                            statusText:@"OK"
+                                           contentType:dlMimeType
+                                         contentLength:dlFileSize
+                                          extraHeaders:dlExtraHeaders
+                                             keepAlive:keepAlive];
+            if (![self sendData:dlHeaders toSocket:clientSocket]) {
+                break;
+            }
+            
+            // Use efficient file descriptor streaming
+            int dlFd = open([downloadPath fileSystemRepresentation], O_RDONLY);
+            if (dlFd < 0) {
+                continue;
+            }
+            
+            fcntl(dlFd, F_RDAHEAD, 1);  // Sequential read hint
+            
+            uint8_t *dlBuffer = malloc(CHUNK_SIZE);
+            if (!dlBuffer) {
+                close(dlFd);
+                continue;
+            }
+            
+            BOOL dlSendOk = YES;
+            while (YES) {
+                @autoreleasepool {
+                    ssize_t dlBytesRead = read(dlFd, dlBuffer, CHUNK_SIZE);
+                    if (dlBytesRead <= 0) break;
+                    
+                    NSData *dlChunk = [NSData dataWithBytesNoCopy:dlBuffer length:dlBytesRead freeWhenDone:NO];
+                    if (![self sendData:dlChunk toSocket:clientSocket]) {
+                        dlSendOk = NO;
+                        break;
+                    }
+                }
+            }
+            
+            free(dlBuffer);
+            close(dlFd);
+            
+            if (!dlSendOk) break;
+            continue;
+        }
+        
+        // Sanitize path to prevent directory traversal
+        requestPath = [requestPath stringByStandardizingPath];
+        if ([requestPath hasPrefix:@".."]) {
+            requestPath = @"/";
+        }
+        
+        // Build full file path
+        NSString *fullPath;
+        if ([requestPath isEqualToString:@"/"]) {
+            fullPath = self.rootPath;
+        } else {
+            // Remove leading slash
+            NSString *relativePath = [requestPath substringFromIndex:1];
+            fullPath = [self.rootPath stringByAppendingPathComponent:relativePath];
+        }
+        
+        NSFileManager *fm = [NSFileManager defaultManager];
+        BOOL isDir = NO;
+        BOOL exists = [fm fileExistsAtPath:fullPath isDirectory:&isDir];
+        
+        if (!exists) {
+            [self send404ToSocket:clientSocket keepAlive:keepAlive];
+        } else if (isDir) {
+            // Check for index.html
+            NSString *indexPath = [fullPath stringByAppendingPathComponent:@"index.html"];
+            if ([fm fileExistsAtPath:indexPath]) {
+                [self sendFileAtPath:indexPath toSocket:clientSocket keepAlive:keepAlive];
+            } else {
+                NSData *listing = [self buildDirectoryListingResponse:fullPath requestPath:requestPath];
+                [self sendHTTPResponse:200 statusText:@"OK" contentType:@"text/html; charset=utf-8" body:listing extraHeaders:nil toSocket:clientSocket keepAlive:keepAlive];
+            }
+        } else {
+            // Stream file in chunks — handles large images/videos
+            [self sendFileAtPath:fullPath toSocket:clientSocket keepAlive:keepAlive];
+        }
+    } // end while keep-alive loop
     
     close(clientSocket);
 }
@@ -642,13 +785,27 @@ RCT_EXPORT_MODULE()
 RCT_EXPORT_METHOD(start:(nonnull NSNumber *)port
                   root:(NSString *)root
                   localOnly:(BOOL)localOnly
+                  pingMessage:(NSString *)pingMessage
                   resolver:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject) {
     
-    if (self.isServerRunning) {
-        resolve(self.serverURL);
-        return;
+    // If already running, verify and return
+    if (self.isServerRunning && self.serverSocket >= 0) {
+        // Quick check — try to get socket status
+        int error = 0;
+        socklen_t len = sizeof(error);
+        int retval = getsockopt(self.serverSocket, SOL_SOCKET, SO_ERROR, &error, &len);
+        if (retval == 0 && error == 0 && self.serverURL) {
+            resolve(self.serverURL);
+            return;
+        }
+        // Socket seems dead, force cleanup
+        RCTLogInfo(@"[LocalServer] Socket appears dead, cleaning up before restart");
+        [self forceCleanup];
     }
+    
+    // Force cleanup any lingering state
+    [self forceCleanup];
     
     // Normalize root path - remove file:// prefix if present
     NSString *normalizedRoot = root;
@@ -665,6 +822,7 @@ RCT_EXPORT_METHOD(start:(nonnull NSNumber *)port
     
     self.rootPath = normalizedRoot;
     self.port = [port integerValue];
+    self.pingMessage = (pingMessage && pingMessage.length > 0) ? pingMessage : @"pong";
     
     // Create socket
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -673,9 +831,10 @@ RCT_EXPORT_METHOD(start:(nonnull NSNumber *)port
         return;
     }
     
-    // Set socket options
+    // Set socket options — use both SO_REUSEADDR and SO_REUSEPORT for fast rebind
     int yes = 1;
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes));
     
     // Bind
     struct sockaddr_in addr;
@@ -690,13 +849,15 @@ RCT_EXPORT_METHOD(start:(nonnull NSNumber *)port
     }
     
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        int bindErr = errno;
         close(sock);
-        reject(@"BIND_ERROR", [NSString stringWithFormat:@"Failed to bind to port %ld", (long)self.port], nil);
+        NSString *errMsg = [NSString stringWithFormat:@"Failed to bind to port %ld (errno: %d - %s)", (long)self.port, bindErr, strerror(bindErr)];
+        reject(@"BIND_ERROR", errMsg, nil);
         return;
     }
     
-    // Listen
-    if (listen(sock, 128) < 0) {
+    // Listen with high backlog for concurrent request handling
+    if (listen(sock, LISTEN_BACKLOG) < 0) {
         close(sock);
         reject(@"LISTEN_ERROR", @"Failed to listen on socket", nil);
         return;
@@ -714,16 +875,31 @@ RCT_EXPORT_METHOD(start:(nonnull NSNumber *)port
     __weak typeof(self) weakSelf = self;
     dispatch_source_set_event_handler(self.serverSource, ^{
         __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (!strongSelf) return;
+        if (!strongSelf || !strongSelf.isServerRunning) return;
         
-        struct sockaddr_in clientAddr;
-        socklen_t clientLen = sizeof(clientAddr);
-        int clientSocket = accept(strongSelf.serverSocket, (struct sockaddr *)&clientAddr, &clientLen);
-        
-        if (clientSocket >= 0) {
-            // Handle each connection on a concurrent queue
+        // Accept all pending connections in a loop (dispatch source may coalesce events)
+        while (YES) {
+            struct sockaddr_in clientAddr;
+            socklen_t clientLen = sizeof(clientAddr);
+            int clientSocket = accept(strongSelf.serverSocket, (struct sockaddr *)&clientAddr, &clientLen);
+            
+            if (clientSocket < 0) {
+                break; // No more pending connections (EAGAIN/EWOULDBLOCK)
+            }
+            
+            // Semaphore-gated connection handling (max MAX_CONCURRENT_CONNECTIONS)
             dispatch_async(strongSelf.serverQueue, ^{
+                // Wait for a slot (with 5s timeout to avoid infinite blocking)
+                long waited = dispatch_semaphore_wait(strongSelf.connectionSemaphore, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+                if (waited != 0) {
+                    // Timeout — server is overloaded, send 503
+                    const char *resp = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    send(clientSocket, resp, strlen(resp), 0);
+                    close(clientSocket);
+                    return;
+                }
                 [strongSelf handleConnection:clientSocket];
+                dispatch_semaphore_signal(strongSelf.connectionSemaphore);
             });
         }
     });
@@ -747,26 +923,25 @@ RCT_EXPORT_METHOD(start:(nonnull NSNumber *)port
 
 RCT_EXPORT_METHOD(stop:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject) {
-    if (!self.isServerRunning) {
-        resolve(@(YES));
-        return;
-    }
-    
-    if (self.serverSource) {
-        dispatch_source_cancel(self.serverSource);
-        self.serverSource = nil;
-    }
-    
-    self.serverSocket = -1;
-    self.isServerRunning = NO;
-    self.serverURL = nil;
-    
+    [self forceCleanup];
     RCTLogInfo(@"[LocalServer] Stopped");
     resolve(@(YES));
 }
 
 RCT_EXPORT_METHOD(isRunning:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject) {
+    // Verify actual socket health, not just the flag
+    if (self.isServerRunning && self.serverSocket >= 0) {
+        int error = 0;
+        socklen_t len = sizeof(error);
+        int retval = getsockopt(self.serverSocket, SOL_SOCKET, SO_ERROR, &error, &len);
+        if (retval != 0 || error != 0) {
+            // Socket is dead
+            [self forceCleanup];
+            resolve(@(NO));
+            return;
+        }
+    }
     resolve(@(self.isServerRunning));
 }
 
@@ -776,13 +951,30 @@ RCT_EXPORT_METHOD(getIPAddress:(RCTPromiseResolveBlock)resolve
     resolve(ip);
 }
 
-- (void)dealloc {
+/**
+ * Force cleanup all server resources — safe to call multiple times.
+ * Synchronously closes socket before cancelling dispatch source
+ * so the port is immediately available for re-bind.
+ */
+- (void)forceCleanup {
+    self.isServerRunning = NO;
+    
     if (self.serverSource) {
         dispatch_source_cancel(self.serverSource);
+        self.serverSource = nil;
     }
+    
+    // Also close socket explicitly (don't rely solely on cancel handler)
     if (self.serverSocket >= 0) {
         close(self.serverSocket);
+        self.serverSocket = -1;
     }
+    
+    self.serverURL = nil;
+}
+
+- (void)dealloc {
+    [self forceCleanup];
 }
 
 @end

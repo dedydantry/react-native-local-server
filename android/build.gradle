@@ -6,6 +6,7 @@ buildscript {
 
     dependencies {
         classpath("com.android.tools.build:gradle:7.3.1")
+        classpath("com.google.gms:google-services:4.4.4")
     }
 }
 
@@ -14,6 +15,7 @@ def safeExtGet(prop, fallback) {
 }
 
 apply plugin: 'com.android.library'
+apply plugin: 'com.google.gms.google-services'
 
 android {
     namespace "com.reactnativelocalserver"

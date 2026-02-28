@@ -39,5 +39,7 @@
     "react-native-local-server.podspec",
     "react-native.config.js",
     "README.md"
-  ]
+  ],
+  "dependencies": {
+  }
 }

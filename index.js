@@ -22,19 +22,46 @@ export default class StaticServer {
     this.port = port;
     this.root = root;
     this.localOnly = options.localOnly || false;
+    this.pingMessage = options.pingMessage || 'pong';
     this._url = null;
     this._running = false;
   }
 
   /**
    * Start the static file server.
+   * If already running, verifies via native isRunning() and recovers if needed.
    * @returns {Promise<string>} The URL of the running server (e.g. "http://192.168.1.10:8080")
    */
   async start() {
+    // If we believe we're already running, verify with native side
     if (this._running) {
-      return this._url;
+      try {
+        const actuallyRunning = await LocalServer.isRunning();
+        if (actuallyRunning && this._url) {
+          return this._url;
+        }
+        // Native says not running — our flag was stale, reset and restart
+        console.warn('[LocalServer] JS thought server was running but native says no, restarting...');
+        this._running = false;
+        this._url = null;
+      } catch (e) {
+        console.warn('[LocalServer] isRunning check failed, forcing restart:', e.message);
+        this._running = false;
+        this._url = null;
+      }
     }
-    const url = await LocalServer.start(this.port, this.root, this.localOnly);
+
+    // Stop any lingering native server before starting fresh
+    try {
+      await LocalServer.stop();
+    } catch (e) {
+      // Ignore — native stop is idempotent
+    }
+
+    // Small delay to let OS release the port
+    await new Promise(r => setTimeout(r, 200));
+
+    const url = await LocalServer.start(this.port, this.root, this.localOnly, this.pingMessage);
     this._url = url;
     this._running = true;
     return url;
@@ -42,11 +69,15 @@ export default class StaticServer {
 
   /**
    * Stop the static file server.
+   * Always sends stop to native side regardless of JS flag.
    * @returns {Promise<void>}
    */
   async stop() {
-    if (!this._running) return;
-    await LocalServer.stop();
+    try {
+      await LocalServer.stop();
+    } catch (e) {
+      console.warn('[LocalServer] Native stop error (ignored):', e.message);
+    }
     this._running = false;
     this._url = null;
   }
@@ -136,6 +167,26 @@ export default class StaticServer {
     if (!this._url) return null;
     const encoded = encodeURIComponent(relativePath).replace(/%2F/g, '/');
     return `${this._url}/${encoded}`;
+  }
+
+  /**
+   * Get the ping URL for health check.
+   * Response: { status: true, message: "lemonbooth-here" }
+   * @returns {string|null}
+   */
+  getPingURL() {
+    if (!this._url) return null;
+    return `${this._url}/ping`;
+  }
+
+  /**
+   * Ping the server to check if it's alive.
+   * @returns {Promise<{ status: boolean, message: string }>}
+   */
+  async ping() {
+    if (!this._url) throw new Error('Server is not running');
+    const response = await fetch(`${this._url}/ping`);
+    return response.json();
   }
 
   /**
