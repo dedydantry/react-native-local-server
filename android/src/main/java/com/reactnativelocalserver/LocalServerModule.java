@@ -725,16 +725,44 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
         this.port = (int) portNumber;
         this.pingMessage = (pingMessage != null && !pingMessage.isEmpty()) ? pingMessage : "pong";
 
-        try {
-            serverSocket = new ServerSocket();
-            serverSocket.setReuseAddress(true);
+        // Try to release lingering TIME_WAIT on the port
+        forceReleasePort(this.port);
 
-            if (localOnly) {
-                serverSocket.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), this.port), LISTEN_BACKLOG);
-            } else {
-                serverSocket.bind(new InetSocketAddress(this.port), LISTEN_BACKLOG);
+        // Bind with retry — port may take a moment to be freed after forceCleanup
+        IOException lastBindError = null;
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            try {
+                serverSocket = new ServerSocket();
+                serverSocket.setReuseAddress(true);
+
+                if (localOnly) {
+                    serverSocket.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), this.port), LISTEN_BACKLOG);
+                } else {
+                    serverSocket.bind(new InetSocketAddress(this.port), LISTEN_BACKLOG);
+                }
+                lastBindError = null;
+                break; // bind succeeded
+            } catch (IOException e) {
+                lastBindError = e;
+                Log.w(TAG, "Bind attempt " + attempt + " failed: " + e.getMessage());
+                // Close the failed socket before retry
+                try { if (serverSocket != null) serverSocket.close(); } catch (IOException ignored) {}
+                serverSocket = null;
+                if (attempt < 3) {
+                    try { Thread.sleep(500 * attempt); } catch (InterruptedException ignored) {}
+                    forceReleasePort(this.port);
+                }
             }
+        }
 
+        if (lastBindError != null || serverSocket == null) {
+            forceCleanup();
+            promise.reject("START_ERROR", "Failed to bind port " + this.port + " after 3 attempts: "
+                    + (lastBindError != null ? lastBindError.getMessage() : "unknown error"), lastBindError);
+            return;
+        }
+
+        try {
             // Bounded thread pool: core=16, max=MAX_CONCURRENT_CONNECTIONS, queue=1024
             // Prevents OOM from unbounded thread creation under heavy load
             connectionSemaphore = new Semaphore(MAX_CONCURRENT_CONNECTIONS);
@@ -771,7 +799,7 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
             Log.i(TAG, "Started at " + serverURL + ", serving: " + this.rootPath);
             promise.resolve(serverURL);
 
-        } catch (IOException e) {
+        } catch (Exception e) {
             forceCleanup();
             promise.reject("START_ERROR", "Failed to start server: " + e.getMessage(), e);
         }
@@ -804,13 +832,14 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
 
     /**
      * Force cleanup all server resources — safe to call multiple times.
-     * Closes socket FIRST to unblock the accept thread, then interrupts.
+     * Closes socket FIRST to unblock the accept thread, then waits for
+     * active connections to drain so the port is fully released.
      */
     private void forceCleanup() {
         isServerRunning = false;
         serverURL = null;
 
-        // Close socket FIRST — this unblocks accept() immediately
+        // 1. Close server socket FIRST — unblocks accept() immediately
         if (serverSocket != null) {
             try {
                 if (!serverSocket.isClosed()) {
@@ -822,16 +851,41 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
             serverSocket = null;
         }
 
-        // Then interrupt and dereference accept thread
+        // 2. Interrupt accept thread and wait for it to exit
         if (acceptThread != null) {
             acceptThread.interrupt();
+            try {
+                acceptThread.join(3000); // wait up to 3s
+            } catch (InterruptedException ignored) {}
             acceptThread = null;
         }
 
-        // Shutdown executor — active connection handlers get interrupted
+        // 3. Shutdown executor and WAIT for active connections to close
+        //    This ensures all client sockets are closed and the port is freed.
         if (executor != null) {
             executor.shutdownNow();
+            try {
+                if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                    Log.w(TAG, "Executor did not terminate within 5s");
+                }
+            } catch (InterruptedException ignored) {}
             executor = null;
+        }
+    }
+
+    /**
+     * Try to kill any lingering socket holding the given port.
+     * Creates a momentary connection to trigger the OS to release TIME_WAIT state,
+     * then immediately closes it. Harmless if nothing is listening.
+     */
+    private void forceReleasePort(int targetPort) {
+        try {
+            Socket probe = new Socket();
+            probe.setSoLinger(true, 0); // RST on close — forces OS to release immediately
+            probe.connect(new InetSocketAddress("127.0.0.1", targetPort), 200);
+            probe.close();
+        } catch (IOException ignored) {
+            // Expected — nothing listening, or connect refused. Port is likely free.
         }
     }
 }
