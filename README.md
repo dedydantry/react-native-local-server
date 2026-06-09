@@ -223,6 +223,52 @@ When the server is running, these endpoints are available:
 | `GET /api/dir` | JSON listing of root directory contents |
 | `GET /api/dir/<path>` | JSON listing of subdirectory contents |
 | `GET /download/<path>` | Force download file with `Content-Disposition: attachment` |
+| `POST /global-post` | Capture request body and forward it to JS (see below). Always replies `200 {success, requestId}` immediately (fire-and-forget). |
+
+## Receiving POST data in JS (`/global-post`)
+
+`POST /global-post` lets another device/process push data into the app. The native server
+captures the body, **immediately replies `200 OK`**, and forwards the request to JS via an event.
+The body is handled by `Content-Type`:
+
+- **JSON / text** (`application/json`, `text/*`, …) → delivered inline as a `body` string.
+- **Everything else** (images, binary, or oversized text >8MB) → written to a temp file; the
+  absolute `filePath` is delivered instead (no large bytes cross the bridge).
+
+```javascript
+import StaticServer from 'react-native-local-server';
+import * as FileSystem from 'expo-file-system';
+
+const sub = StaticServer.addRequestListener(async (req) => {
+  // req: { requestId, path, method, contentType, query, size, headers, bodyType, body?, filePath? }
+  if (req.bodyType === 'json') {
+    const data = JSON.parse(req.body);
+    console.log('Got JSON:', data);
+  } else if (req.bodyType === 'file') {
+    // Move it somewhere permanent — the library does NOT clean up the temp file.
+    const dest = FileSystem.documentDirectory + 'incoming.jpg';
+    await FileSystem.moveAsync({ from: 'file://' + req.filePath, to: dest });
+    console.log('Got file:', dest, req.size, 'bytes');
+  }
+});
+
+// later: sub.remove();
+```
+
+Posting from another device:
+
+```bash
+# JSON → arrives as req.body (string)
+curl -X POST http://192.168.1.10:8080/global-post \
+  -H 'Content-Type: application/json' -d '{"hello":"world"}'
+
+# Image → arrives as req.filePath
+curl -X POST http://192.168.1.10:8080/global-post \
+  -H 'Content-Type: image/jpeg' --data-binary @photo.jpg
+```
+
+> Metadata can travel in custom headers (e.g. `X-My-Meta`) — all request headers are forwarded
+> in `req.headers` (lowercase keys). Use `Content-Length`; chunked `Transfer-Encoding` returns `411`.
 
 ## Supported MIME Types
 

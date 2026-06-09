@@ -1,6 +1,7 @@
 #import "LocalServer.h"
 #import <React/RCTLog.h>
 #import <GCDWebServer/GCDWebServer.h>
+#import <GCDWebServer/GCDWebServerDataRequest.h>
 #import <GCDWebServer/GCDWebServerDataResponse.h>
 #import <GCDWebServer/GCDWebServerFileResponse.h>
 #import <ifaddrs.h>
@@ -14,6 +15,8 @@
 @property (nonatomic, strong) NSString *serverURL;
 @property (nonatomic, strong) NSString *pingMessage;
 @property (nonatomic, strong) dispatch_queue_t stateQueue;
+@property (nonatomic, assign) BOOL hasListeners;
+@property (nonatomic, assign) NSUInteger requestCounter;
 @end
 
 @implementation LocalServer
@@ -30,6 +33,56 @@ RCT_EXPORT_MODULE()
 
 + (BOOL)requiresMainQueueSetup {
     return NO;
+}
+
+#pragma mark - RCTEventEmitter
+
+- (NSArray<NSString *> *)supportedEvents {
+    return @[@"LocalServerRequest"];
+}
+
+- (void)startObserving {
+    self.hasListeners = YES;
+}
+
+- (void)stopObserving {
+    self.hasListeners = NO;
+}
+
+- (void)emitRequestEvent:(NSDictionary *)payload {
+    if (self.hasListeners) {
+        [self sendEventWithName:@"LocalServerRequest" body:payload];
+    }
+}
+
+#pragma mark - POST body helpers
+
+- (BOOL)isTextContentType:(NSString *)ct {
+    // Default unknown/missing → binary (file), so arbitrary bytes are never UTF-8 corrupted.
+    if (ct.length == 0) return NO;
+    NSString *c = [ct lowercaseString];
+    return [c hasPrefix:@"text/"] || [c containsString:@"application/json"]
+        || [c containsString:@"+json"] || [c containsString:@"application/x-www-form-urlencoded"];
+}
+
+- (BOOL)isJsonContentType:(NSString *)ct {
+    if (ct.length == 0) return NO;
+    NSString *c = [ct lowercaseString];
+    return [c containsString:@"application/json"] || [c containsString:@"+json"];
+}
+
+- (NSString *)extensionForContentType:(NSString *)ct {
+    if (ct.length == 0) return @".bin";
+    NSString *c = [ct lowercaseString];
+    if ([c containsString:@"jpeg"] || [c containsString:@"jpg"]) return @".jpg";
+    if ([c containsString:@"png"]) return @".png";
+    if ([c containsString:@"gif"]) return @".gif";
+    if ([c containsString:@"webp"]) return @".webp";
+    if ([c containsString:@"heic"]) return @".heic";
+    if ([c containsString:@"pdf"]) return @".pdf";
+    if ([c containsString:@"json"]) return @".json";
+    if ([c hasPrefix:@"text/"]) return @".txt";
+    return @".bin";
 }
 
 - (void)initializeGCDWebServerOnMainThread:(dispatch_block_t)completion {
@@ -131,7 +184,7 @@ RCT_EXPORT_MODULE()
 
 - (GCDWebServerResponse *)responseWithCORS:(GCDWebServerResponse *)response {
     [response setValue:@"*" forAdditionalHeader:@"Access-Control-Allow-Origin"];
-    [response setValue:@"GET, HEAD, OPTIONS" forAdditionalHeader:@"Access-Control-Allow-Methods"];
+    [response setValue:@"GET, HEAD, POST, OPTIONS" forAdditionalHeader:@"Access-Control-Allow-Methods"];
     [response setValue:@"*" forAdditionalHeader:@"Access-Control-Allow-Headers"];
     return response;
 }
@@ -483,12 +536,86 @@ RCT_EXPORT_MODULE()
         return [weakSelf fileResponseForPath:filePath request:request attachment:YES];
     }];
 
+    [server addHandlerForMethod:@"POST"
+                           path:@"/global-post"
+                   requestClass:[GCDWebServerDataRequest class]
+                   processBlock:^GCDWebServerResponse *(GCDWebServerRequest *request) {
+        return [weakSelf handleGlobalPost:(GCDWebServerDataRequest *)request];
+    }];
+
     [server addDefaultHandlerForMethod:@"OPTIONS"
                           requestClass:[GCDWebServerRequest class]
                           processBlock:^GCDWebServerResponse *(GCDWebServerRequest *request) {
         GCDWebServerResponse *response = [GCDWebServerResponse responseWithStatusCode:204];
         return [weakSelf responseWithCORS:response];
     }];
+}
+
+#pragma mark - POST /global-post
+
+- (GCDWebServerResponse *)handleGlobalPost:(GCDWebServerDataRequest *)request {
+    NSString *contentType = request.contentType ?: @"";
+    NSData *data = request.data ?: [NSData data];
+
+    self.requestCounter += 1;
+    NSString *requestId = [NSString stringWithFormat:@"post-%.0f-%lu",
+                           [[NSDate date] timeIntervalSince1970] * 1000.0,
+                           (unsigned long)self.requestCounter];
+
+    BOOL isText = [self isTextContentType:contentType];
+    BOOL asFile = !isText || data.length > (8 * 1024 * 1024);
+
+    NSMutableDictionary *payload = [NSMutableDictionary dictionary];
+    payload[@"requestId"] = requestId;
+    payload[@"path"] = @"/global-post";
+    payload[@"method"] = @"POST";
+    payload[@"contentType"] = contentType;
+    payload[@"query"] = request.URL.query ?: @"";
+    payload[@"size"] = @(data.length);
+
+    // Best-effort full headers (lowercase keys) for parity with Android.
+    // GCDWebServerRequest has no public all-headers accessor, so fall back to a known subset.
+    NSMutableDictionary *headers = [NSMutableDictionary dictionary];
+    NSDictionary *allHeaders = nil;
+    @try {
+        id raw = [request valueForKey:@"headers"];
+        if ([raw isKindOfClass:[NSDictionary class]]) {
+            allHeaders = raw;
+        }
+    } @catch (__unused NSException *e) {}
+
+    if (allHeaders) {
+        [allHeaders enumerateKeysAndObjectsUsingBlock:^(NSString *k, id v, BOOL *stop) {
+            if ([k isKindOfClass:[NSString class]] && [v isKindOfClass:[NSString class]]) {
+                headers[[k lowercaseString]] = v;
+            }
+        }];
+    } else {
+        if (contentType.length > 0) headers[@"content-type"] = contentType;
+        headers[@"content-length"] = @(data.length).stringValue;
+    }
+    payload[@"headers"] = headers;
+
+    if (asFile) {
+        NSString *ext = [self extensionForContentType:contentType];
+        NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"global-post"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                  withIntermediateDirectories:YES
+                                                   attributes:nil
+                                                        error:nil];
+        NSString *filePath = [dir stringByAppendingPathComponent:[requestId stringByAppendingString:ext]];
+        [data writeToFile:filePath atomically:YES];
+        payload[@"bodyType"] = @"file";
+        payload[@"filePath"] = filePath;
+    } else {
+        NSString *bodyString = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
+        payload[@"bodyType"] = [self isJsonContentType:contentType] ? @"json" : @"text";
+        payload[@"body"] = bodyString;
+    }
+
+    [self emitRequestEvent:payload];
+
+    return [self jsonResponse:@{ @"success": @(YES), @"requestId": requestId } statusCode:200];
 }
 
 #pragma mark - Server Control

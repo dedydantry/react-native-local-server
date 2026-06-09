@@ -1,4 +1,4 @@
-import { NativeModules, Platform } from 'react-native';
+import { NativeModules, NativeEventEmitter, Platform } from 'react-native';
 
 const LINKING_ERROR =
   `The package 'react-native-local-server' doesn't seem to be linked. Make sure: \n\n` +
@@ -16,6 +16,16 @@ const LocalServer = NativeModules.LocalServer
         },
       }
     );
+
+// Event emitter for native-forwarded requests (e.g. POST /global-post).
+let serverEmitter = null;
+if (NativeModules.LocalServer) {
+  try {
+    serverEmitter = new NativeEventEmitter(NativeModules.LocalServer);
+  } catch (e) {
+    console.warn('[LocalServer] Failed to create event emitter:', e.message);
+  }
+}
 
 export default class StaticServer {
   constructor(port = 8080, root = '', options = {}) {
@@ -216,5 +226,37 @@ export default class StaticServer {
    */
   static async isNativeRunning() {
     return LocalServer.isRunning();
+  }
+
+  /**
+   * Subscribe to inbound requests the native server forwards to JS.
+   * Currently fired for `POST /global-post` (fire-and-forget: native already replied 200).
+   *
+   * The callback receives:
+   * {
+   *   requestId: string,       // unique id for this request
+   *   path: string,            // "/global-post"
+   *   method: string,          // "POST"
+   *   contentType: string,     // raw Content-Type header
+   *   query: string,           // raw query string (without "?")
+   *   size: number,            // body size in bytes
+   *   headers: { [lowercaseName]: string },
+   *   bodyType: 'json' | 'text' | 'file',
+   *   body?: string,           // present when bodyType is 'json' | 'text' (parse JSON yourself)
+   *   filePath?: string,       // present when bodyType is 'file' — absolute path to a temp file
+   * }
+   *
+   * Note: for 'file' bodies the temp file lives in the app cache/temp dir — move or delete it
+   * once consumed; the library does not clean it up automatically.
+   *
+   * @param {(event: object) => void} callback
+   * @returns {{ remove: () => void }} subscription handle
+   */
+  static addRequestListener(callback) {
+    if (!serverEmitter) {
+      console.warn('[LocalServer] Event emitter unavailable; addRequestListener is a no-op');
+      return { remove() {} };
+    }
+    return serverEmitter.addListener('LocalServerRequest', callback);
   }
 }

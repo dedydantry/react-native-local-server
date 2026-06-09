@@ -5,10 +5,13 @@ import android.net.wifi.WifiManager;
 import android.content.Context;
 import android.util.Log;
 
+import com.facebook.react.bridge.Arguments;
 import com.facebook.react.bridge.Promise;
 import com.facebook.react.bridge.ReactApplicationContext;
 import com.facebook.react.bridge.ReactContextBaseJavaModule;
 import com.facebook.react.bridge.ReactMethod;
+import com.facebook.react.bridge.WritableMap;
+import com.facebook.react.modules.core.DeviceEventManagerModule;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -16,6 +19,7 @@ import org.json.JSONObject;
 import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -43,6 +47,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Pure Java socket-based HTTP static file server for React Native Android.
@@ -58,6 +63,11 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
     private static final int KEEPALIVE_TIMEOUT = 5; // seconds idle between keep-alive requests
     private static final int KEEPALIVE_MAX_REQUESTS = 100; // max requests per persistent connection
     private static final int MAX_HEADER_SIZE = 32 * 1024;
+    private static final int MAX_INMEMORY_BODY = 8 * 1024 * 1024; // 8MB cap for text/JSON bodies
+    private static final String POST_EVENT = "LocalServerRequest";
+    private static final String GLOBAL_POST_PATH = "/global-post";
+
+    private final AtomicLong requestCounter = new AtomicLong(0);
 
     private volatile ServerSocket serverSocket;
     private volatile String rootPath;
@@ -193,7 +203,7 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
             sb.append("Connection: close\r\n");
         }
         sb.append("Access-Control-Allow-Origin: *\r\n");
-        sb.append("Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n");
+        sb.append("Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS\r\n");
         sb.append("Access-Control-Allow-Headers: *\r\n");
         if (extraHeaders == null || !extraHeaders.containsKey("Cache-Control")) {
             sb.append("Cache-Control: no-cache\r\n");
@@ -725,6 +735,15 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
                     continue;
                 }
 
+                // --- POST /global-post → capture body, hand it to JS (fire-and-forget) ---
+                if ("POST".equals(httpMethod) && GLOBAL_POST_PATH.equals(requestPath)) {
+                    String rawTarget = requestParts.length > 1 ? requestParts[1] : "";
+                    int qi = rawTarget.indexOf('?');
+                    String query = qi >= 0 ? rawTarget.substring(qi + 1) : "";
+                    handleGlobalPost(in, out, reqHeaders, query, keepAlive);
+                    continue;
+                }
+
                 // --- API Route: /ping → health check ---
                 if ("/ping".equals(requestPath) || "/ping/".equals(requestPath)) {
                     byte[] pingBody = ("{\"status\":true,\"message\":\"" + pingMessage + "\"}").getBytes(StandardCharsets.UTF_8);
@@ -822,8 +841,164 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
     }
 
     // -------------------------------------------------------------------------
+    // POST /global-post — capture body and forward to JS (fire-and-forget)
+    // -------------------------------------------------------------------------
+
+    private boolean isTextContentType(String ct) {
+        // Default unknown/missing → binary (file), so arbitrary bytes are never UTF-8 corrupted.
+        // JSON/text clients send application/json or text/* (RN/browser fetch defaults to text/plain).
+        if (ct == null) return false;
+        String c = ct.toLowerCase();
+        return c.startsWith("text/") || c.contains("application/json")
+                || c.contains("+json") || c.contains("application/x-www-form-urlencoded");
+    }
+
+    private boolean isJsonContentType(String ct) {
+        if (ct == null) return false;
+        String c = ct.toLowerCase();
+        return c.contains("application/json") || c.contains("+json");
+    }
+
+    private String extensionForContentType(String ct) {
+        if (ct == null) return ".bin";
+        String c = ct.toLowerCase();
+        if (c.contains("jpeg") || c.contains("jpg")) return ".jpg";
+        if (c.contains("png")) return ".png";
+        if (c.contains("gif")) return ".gif";
+        if (c.contains("webp")) return ".webp";
+        if (c.contains("heic")) return ".heic";
+        if (c.contains("pdf")) return ".pdf";
+        if (c.contains("json")) return ".json";
+        if (c.startsWith("text/")) return ".txt";
+        return ".bin";
+    }
+
+    private long streamToFile(InputStream in, File file, long length) throws IOException {
+        long received = 0;
+        try (FileOutputStream fos = new FileOutputStream(file)) {
+            byte[] buf = new byte[CHUNK_SIZE];
+            long remaining = length;
+            while (remaining > 0) {
+                int r = in.read(buf, 0, (int) Math.min(buf.length, remaining));
+                if (r == -1) break;
+                fos.write(buf, 0, r);
+                received += r;
+                remaining -= r;
+            }
+            fos.flush();
+        }
+        return received;
+    }
+
+    private byte[] readNBytes(InputStream in, int length) throws IOException {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream(Math.max(0, Math.min(length, 64 * 1024)));
+        byte[] buf = new byte[CHUNK_SIZE];
+        int remaining = length;
+        while (remaining > 0) {
+            int r = in.read(buf, 0, Math.min(buf.length, remaining));
+            if (r == -1) break;
+            bos.write(buf, 0, r);
+            remaining -= r;
+        }
+        return bos.toByteArray();
+    }
+
+    private void emitRequestEvent(WritableMap payload) {
+        try {
+            ReactApplicationContext ctx = getReactApplicationContext();
+            if (ctx != null && ctx.hasActiveReactInstance()) {
+                ctx.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class).emit(POST_EVENT, payload);
+            } else {
+                Log.w(TAG, "No active React instance — dropping " + POST_EVENT);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to emit " + POST_EVENT, e);
+        }
+    }
+
+    /**
+     * Read the POST body and emit it to JS. Text/JSON bodies are sent inline as a string;
+     * everything else (and oversized text) is streamed to a temp file and the path is sent.
+     * Always consumes exactly Content-Length bytes so keep-alive stays correct.
+     */
+    private void handleGlobalPost(InputStream in, OutputStream out, Map<String, String> reqHeaders,
+                                  String query, boolean keepAlive) throws IOException {
+        String contentType = reqHeaders.get("content-type");
+        String transferEncoding = reqHeaders.get("transfer-encoding");
+        String lenStr = reqHeaders.get("content-length");
+
+        if (transferEncoding != null && transferEncoding.toLowerCase().contains("chunked")) {
+            byte[] body = "{\"success\":false,\"error\":\"chunked transfer-encoding not supported; send Content-Length\"}"
+                    .getBytes(StandardCharsets.UTF_8);
+            // Can't reliably frame the stream without Content-Length → must close the connection.
+            sendHTTPResponse(out, 411, "Length Required", "application/json; charset=utf-8", body, null, false);
+            return;
+        }
+
+        long contentLength = 0;
+        if (lenStr != null) {
+            try { contentLength = Long.parseLong(lenStr.trim()); } catch (NumberFormatException ignored) {}
+        }
+        if (contentLength < 0) contentLength = 0;
+
+        String requestId = "post-" + System.currentTimeMillis() + "-" + requestCounter.incrementAndGet();
+
+        boolean isText = isTextContentType(contentType);
+        boolean asFile = !isText || contentLength > MAX_INMEMORY_BODY;
+
+        String bodyString = null;
+        File tempFile = null;
+        long received;
+
+        if (asFile) {
+            File dir = new File(getReactApplicationContext().getCacheDir(), "global-post");
+            if (!dir.exists()) dir.mkdirs();
+            tempFile = new File(dir, requestId + extensionForContentType(contentType));
+            received = streamToFile(in, tempFile, contentLength);
+        } else {
+            byte[] bytes = readNBytes(in, (int) contentLength);
+            received = bytes.length;
+            bodyString = new String(bytes, StandardCharsets.UTF_8);
+        }
+
+        WritableMap payload = Arguments.createMap();
+        payload.putString("requestId", requestId);
+        payload.putString("path", GLOBAL_POST_PATH);
+        payload.putString("method", "POST");
+        payload.putString("contentType", contentType != null ? contentType : "");
+        payload.putString("query", query != null ? query : "");
+        payload.putDouble("size", (double) received);
+
+        WritableMap headersMap = Arguments.createMap();
+        for (Map.Entry<String, String> e : reqHeaders.entrySet()) {
+            headersMap.putString(e.getKey(), e.getValue());
+        }
+        payload.putMap("headers", headersMap);
+
+        if (asFile) {
+            payload.putString("bodyType", "file");
+            payload.putString("filePath", tempFile != null ? tempFile.getAbsolutePath() : "");
+        } else {
+            payload.putString("bodyType", isJsonContentType(contentType) ? "json" : "text");
+            payload.putString("body", bodyString != null ? bodyString : "");
+        }
+
+        emitRequestEvent(payload);
+
+        byte[] ack = ("{\"success\":true,\"requestId\":\"" + requestId + "\"}").getBytes(StandardCharsets.UTF_8);
+        sendHTTPResponse(out, 200, "OK", "application/json; charset=utf-8", ack, null, keepAlive);
+    }
+
+    // -------------------------------------------------------------------------
     // Server Control (React Native Methods)
     // -------------------------------------------------------------------------
+
+    // Required by NativeEventEmitter on the JS side; no bookkeeping needed for DeviceEventEmitter.
+    @ReactMethod
+    public void addListener(String eventName) {}
+
+    @ReactMethod
+    public void removeListeners(double count) {}
 
     @ReactMethod
     public void start(double portNumber, String root, boolean localOnly, String pingMessage, Promise promise) {
