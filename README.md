@@ -1,14 +1,21 @@
 # react-native-local-server
 
-A lightweight, zero-dependency local HTTP static file server for React Native. Built with pure native sockets (BSD sockets on iOS, Java ServerSocket on Android) — no third-party server libraries required.
+A lightweight local HTTP static file server for React Native, serving files from any local
+directory over HTTP with chunked streaming, CORS, HTTP Range (resumable downloads), and
+built-in JSON APIs for file/directory listing.
 
-Serves files from any local directory over HTTP with chunked streaming, CORS support, and built-in JSON APIs for file/directory listing.
+> **Implementation note:** iOS is built on [GCDWebServer](https://github.com/swisspol/GCDWebServer)
+> (a small, battle-tested Objective-C HTTP server). Android is a self-contained pure-Java
+> `ServerSocket` implementation. They are kept at feature parity (Range, keep-alive,
+> conditional GET, HEAD), but are two distinct implementations — test platform behavior separately.
 
 ## Features
 
-- **Pure native implementation** — no embedded web server dependencies
 - **Large file streaming** — 256KB chunked transfer, handles images/videos of any size
-- **Cross-platform** — iOS (Objective-C) and Android (Java)
+- **HTTP Range / resumable downloads** — `Accept-Ranges: bytes`, `206 Partial Content`, `416` — interrupted transfers resume instead of restarting (both platforms)
+- **Conditional GET** — `ETag` + `Last-Modified`; `If-None-Match` → `304 Not Modified` (cheap revalidation, no stale photos)
+- **Keep-alive** — persistent connections reuse the TCP socket across requests (fast galleries)
+- **Cross-platform** — iOS (GCDWebServer) and Android (pure Java sockets)
 - **Static file serving** — serves any file type with proper MIME types
 - **JSON API endpoints** — `/api/files` (recursive) and `/api/dir` (non-recursive)
 - **Force download endpoint** — `/download/<path>` with `Content-Disposition: attachment`
@@ -232,11 +239,56 @@ Unrecognized extensions default to `application/octet-stream`.
 
 | | iOS | Android |
 |---|---|---|
-| Socket implementation | BSD sockets + GCD dispatch_source | Java `ServerSocket` + `ExecutorService` |
-| File streaming | `NSFileHandle` (256KB chunks) | `BufferedInputStream` (256KB chunks) |
-| WiFi interface | `en0` / `en1` | `wlan0` / `eth0` |
+| HTTP engine | GCDWebServer 3.5 | Pure Java `ServerSocket` + `ThreadPoolExecutor` |
+| File streaming | GCDWebServer file response (256KB) | `RandomAccessFile` (256KB chunks) |
+| Range / 206 | ✅ (GCDWebServer) | ✅ (single range, `RandomAccessFile.seek`) |
+| Keep-alive | ✅ | ✅ (up to 100 req/conn, 5s idle) |
+| Conditional GET | ✅ ETag/304 | ✅ ETag/304 |
+| `start()`/`stop()` threading | serial GCD queue (off-main) | single-thread `controlExecutor` (off-bridge) |
+| Max concurrent connections | GCDWebServer-managed | 32 (semaphore-gated, 503 when exceeded) |
+| WiFi interface | `en0` / `en1` | `wlan0*` / `eth0` |
 | Min version | iOS 13.0 | Android SDK 21 |
 | Permissions | None required | `INTERNET`, `ACCESS_WIFI_STATE` (auto-merged) |
+
+## Guaranteed transfer — client (downloader) guidance
+
+The server now exposes everything a client needs to make transfers reliable. To **guarantee**
+delivery, the downloading side (desktop app / browser / peer) should:
+
+1. **List with metadata** — `GET /api/files` returns each file's `size` and `modified`. Treat
+   `size` as the expected byte count.
+2. **Resume on failure** — downloads are resumable. On an interrupted transfer, re-request the
+   file with a `Range: bytes=<bytesAlreadyOnDisk>-` header; the server replies `206 Partial Content`
+   and streams only the remainder. Append to the partial file instead of restarting from 0.
+3. **Verify completeness** — after download, assert `bytesOnDisk === size` from the listing. A
+   mismatch means truncation → retry (resume) with exponential backoff.
+4. **Avoid stale reads** — pass the previously received `ETag` as `If-None-Match`; a `304` means
+   the file is unchanged (skip re-download). A changed file returns `200` with a new `ETag`.
+
+Example (Expo / React Native downloader, e.g. mobile-to-mobile):
+
+```javascript
+import * as FileSystem from 'expo-file-system';
+
+async function downloadWithResume(fileUrl, dest, expectedSize, { retries = 5 } = {}) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    const resumable = FileSystem.createDownloadResumable(fileUrl, dest);
+    try {
+      await resumable.downloadAsync();             // resumes automatically if a .part exists
+      const info = await FileSystem.getInfoAsync(dest);
+      if (!expectedSize || info.size === expectedSize) return dest;  // verified
+      // size mismatch → truncated, fall through to retry
+    } catch (e) {
+      // network drop — fall through to retry
+    }
+    await new Promise(r => setTimeout(r, Math.min(1000 * 2 ** attempt, 15000)));
+  }
+  throw new Error(`Download failed/verification mismatch: ${fileUrl}`);
+}
+```
+
+For browsers, no client code is needed — `<a download>` / `fetch` against `/download/<path>`
+already benefit from Range + keep-alive + revalidation transparently.
 
 ## License
 

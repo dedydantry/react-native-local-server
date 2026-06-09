@@ -14,11 +14,12 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.RandomAccessFile;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.NetworkInterface;
@@ -28,10 +29,14 @@ import java.net.SocketException;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
 import java.util.Collections;
+import java.util.Date;
 import java.util.Enumeration;
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
+import java.util.TimeZone;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -48,21 +53,24 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
 
     private static final String TAG = "LocalServer";
     private static final int CHUNK_SIZE = 256 * 1024; // 256KB
-    private static final int HEADER_BUFFER_SIZE = 8192; // 8KB
-    private static final int MAX_CONCURRENT_CONNECTIONS = 64;
+    private static final int MAX_CONCURRENT_CONNECTIONS = 32;
     private static final int LISTEN_BACKLOG = 1024;
-    private static final int KEEPALIVE_TIMEOUT = 15; // seconds
-    private static final int KEEPALIVE_MAX_REQUESTS = 100; // max requests per connection
+    private static final int KEEPALIVE_TIMEOUT = 5; // seconds idle between keep-alive requests
+    private static final int KEEPALIVE_MAX_REQUESTS = 100; // max requests per persistent connection
+    private static final int MAX_HEADER_SIZE = 32 * 1024;
 
-    private ServerSocket serverSocket;
-    private String rootPath;
-    private int port;
-    private boolean isServerRunning = false;
-    private String serverURL;
-    private String pingMessage = "pong";
+    private volatile ServerSocket serverSocket;
+    private volatile String rootPath;
+    private volatile int port;
+    private volatile boolean isServerRunning = false;
+    private volatile String serverURL;
+    private volatile String pingMessage = "pong";
     private ExecutorService executor;
     private Thread acceptThread;
     private Semaphore connectionSemaphore;
+
+    // Serializes start()/stop() OFF the RN bridge thread so native calls never block.
+    private final ExecutorService controlExecutor = Executors.newSingleThreadExecutor();
 
     private static final Map<String, String> MIME_TYPES = new HashMap<>();
 
@@ -187,7 +195,9 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
         sb.append("Access-Control-Allow-Origin: *\r\n");
         sb.append("Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n");
         sb.append("Access-Control-Allow-Headers: *\r\n");
-        sb.append("Cache-Control: no-cache\r\n");
+        if (extraHeaders == null || !extraHeaders.containsKey("Cache-Control")) {
+            sb.append("Cache-Control: no-cache\r\n");
+        }
 
         if (extraHeaders != null) {
             for (Map.Entry<String, String> entry : extraHeaders.entrySet()) {
@@ -211,9 +221,17 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
 
     private void sendHTTPResponse(OutputStream out, int statusCode, String statusText,
                                    String contentType, byte[] body, Map<String, String> extraHeaders, boolean keepAlive) {
+        sendHTTPResponse(out, statusCode, statusText, contentType, body, extraHeaders, keepAlive, false);
+    }
+
+    private void sendHTTPResponse(OutputStream out, int statusCode, String statusText,
+                                   String contentType, byte[] body, Map<String, String> extraHeaders, boolean keepAlive,
+                                   boolean headOnly) {
         String headers = buildHTTPHeaders(statusCode, statusText, contentType, body.length, extraHeaders, keepAlive);
         sendData(out, headers.getBytes(StandardCharsets.UTF_8));
-        sendData(out, body);
+        if (!headOnly) {
+            sendData(out, body);
+        }
     }
 
     private void send404(OutputStream out, boolean keepAlive) {
@@ -225,7 +243,57 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
     // File Streaming
     // -------------------------------------------------------------------------
 
-    private void sendFile(OutputStream out, File file, boolean keepAlive) {
+    /** RFC 1123 date for Last-Modified, always in GMT. */
+    private String httpDate(long epochMillis) {
+        SimpleDateFormat fmt = new SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss 'GMT'", Locale.US);
+        fmt.setTimeZone(TimeZone.getTimeZone("GMT"));
+        return fmt.format(new Date(epochMillis));
+    }
+
+    /**
+     * Parse a single-range "Range: bytes=..." header.
+     * @return {start, end} inclusive if satisfiable; {-1, -1} if unsatisfiable (→ 416);
+     *         null if absent/malformed/multi-range (→ serve full 200).
+     */
+    private long[] parseRange(String rangeHeader, long fileSize) {
+        if (rangeHeader == null) return null;
+        rangeHeader = rangeHeader.trim();
+        if (!rangeHeader.startsWith("bytes=")) return null;
+
+        String spec = rangeHeader.substring(6).trim();
+        if (spec.isEmpty() || spec.contains(",")) return null; // multi-range not supported → full
+        int dash = spec.indexOf('-');
+        if (dash < 0) return null;
+
+        String startStr = spec.substring(0, dash).trim();
+        String endStr = spec.substring(dash + 1).trim();
+        try {
+            long start, end;
+            if (startStr.isEmpty()) {
+                // suffix range: last N bytes
+                if (endStr.isEmpty()) return null;
+                long n = Long.parseLong(endStr);
+                if (n <= 0) return new long[]{-1, -1};
+                start = Math.max(0, fileSize - n);
+                end = fileSize - 1;
+            } else {
+                start = Long.parseLong(startStr);
+                end = endStr.isEmpty() ? fileSize - 1 : Long.parseLong(endStr);
+            }
+            if (start > end || start >= fileSize) return new long[]{-1, -1};
+            if (end >= fileSize) end = fileSize - 1;
+            return new long[]{start, end};
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Serve a file with HTTP Range, conditional-GET (ETag/If-None-Match), keep-alive and HEAD support.
+     * Handles both inline serving and forced-download (attachment) in one path so iOS/Android stay in parity.
+     */
+    private void serveFile(OutputStream out, File file, boolean keepAlive, boolean headOnly,
+                           boolean attachment, Map<String, String> reqHeaders) {
         long fileSize = file.length();
         if (fileSize == 0) {
             send404(out, keepAlive);
@@ -233,60 +301,94 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
         }
 
         String mimeType = getMimeType(file.getName());
+        long lastModified = file.lastModified();
+        String etag = "\"" + fileSize + "-" + lastModified + "\"";
 
-        // Send headers first
-        String headers = buildHTTPHeaders(200, "OK", mimeType, fileSize, null, keepAlive);
+        // Conditional GET — let clients/browsers revalidate cheaply (304, no body).
+        String ifNoneMatch = reqHeaders.get("if-none-match");
+        if (ifNoneMatch != null && ifNoneMatch.equals(etag)) {
+            Map<String, String> h = new HashMap<>();
+            h.put("ETag", etag);
+            h.put("Cache-Control", "no-cache");
+            sendHTTPResponse(out, 304, "Not Modified", mimeType, new byte[0], h, keepAlive, true);
+            return;
+        }
+
+        // Range — only honor when If-Range is absent or matches the current ETag,
+        // so a resumed download can never splice bytes from a changed file.
+        String rangeHeader = reqHeaders.get("range");
+        String ifRange = reqHeaders.get("if-range");
+        boolean rangeAllowed = rangeHeader != null && (ifRange == null || ifRange.equals(etag));
+
+        long start = 0;
+        long end = fileSize - 1;
+        boolean partial = false;
+
+        if (rangeAllowed) {
+            long[] parsed = parseRange(rangeHeader, fileSize);
+            if (parsed != null && parsed[0] == -1) {
+                Map<String, String> h = new HashMap<>();
+                h.put("Content-Range", "bytes */" + fileSize);
+                h.put("Accept-Ranges", "bytes");
+                sendHTTPResponse(out, 416, "Range Not Satisfiable", "text/plain",
+                        new byte[0], h, keepAlive, headOnly);
+                return;
+            }
+            if (parsed != null) {
+                start = parsed[0];
+                end = parsed[1];
+                partial = true;
+            }
+        }
+
+        long contentLength = end - start + 1;
+
+        Map<String, String> extra = new HashMap<>();
+        extra.put("Accept-Ranges", "bytes");
+        extra.put("ETag", etag);
+        extra.put("Last-Modified", httpDate(lastModified));
+        extra.put("Cache-Control", "no-cache");
+        if (attachment) {
+            String fileName = file.getName();
+            String encodedName;
+            try {
+                encodedName = URLEncoder.encode(fileName, "UTF-8").replace("+", "%20");
+            } catch (Exception e) {
+                encodedName = fileName;
+            }
+            extra.put("Content-Disposition",
+                    "attachment; filename=\"" + fileName + "\"; filename*=UTF-8''" + encodedName);
+        }
+        if (partial) {
+            extra.put("Content-Range", "bytes " + start + "-" + end + "/" + fileSize);
+        }
+
+        int statusCode = partial ? 206 : 200;
+        String statusText = partial ? "Partial Content" : "OK";
+
+        String headers = buildHTTPHeaders(statusCode, statusText, mimeType, contentLength, extra, keepAlive);
         if (!sendData(out, headers.getBytes(StandardCharsets.UTF_8))) return;
+        if (headOnly) return;
 
-        // Stream file in chunks (256KB)
-        try (BufferedInputStream bis = new BufferedInputStream(new FileInputStream(file), CHUNK_SIZE)) {
+        // Stream exactly [start, end] in 256KB chunks.
+        try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
+            raf.seek(start);
             byte[] buffer = new byte[CHUNK_SIZE];
-            int bytesRead;
-            while ((bytesRead = bis.read(buffer)) != -1) {
+            long remaining = contentLength;
+            while (remaining > 0) {
+                int toRead = (int) Math.min(buffer.length, remaining);
+                int read = raf.read(buffer, 0, toRead);
+                if (read == -1) break;
                 try {
-                    out.write(buffer, 0, bytesRead);
-                    out.flush();
+                    out.write(buffer, 0, read);
                 } catch (IOException e) {
                     break; // Client disconnected
                 }
+                remaining -= read;
             }
+            out.flush();
         } catch (IOException e) {
             Log.e(TAG, "Error streaming file: " + file.getAbsolutePath(), e);
-        }
-    }
-
-    private void sendFileWithDisposition(OutputStream out, File file, boolean keepAlive) {
-        long fileSize = file.length();
-        String mimeType = getMimeType(file.getName());
-        String fileName = file.getName();
-        String encodedName;
-        try {
-            encodedName = URLEncoder.encode(fileName, "UTF-8").replace("+", "%20");
-        } catch (Exception e) {
-            encodedName = fileName;
-        }
-
-        Map<String, String> extraHeaders = new HashMap<>();
-        extraHeaders.put("Content-Disposition",
-                "attachment; filename=\"" + fileName + "\"; filename*=UTF-8''" + encodedName);
-
-        String headers = buildHTTPHeaders(200, "OK", mimeType, fileSize, extraHeaders, keepAlive);
-        if (!sendData(out, headers.getBytes(StandardCharsets.UTF_8))) return;
-
-        // Stream
-        try (BufferedInputStream bis = new BufferedInputStream(new FileInputStream(file), CHUNK_SIZE)) {
-            byte[] buffer = new byte[CHUNK_SIZE];
-            int bytesRead;
-            while ((bytesRead = bis.read(buffer)) != -1) {
-                try {
-                    out.write(buffer, 0, bytesRead);
-                    out.flush();
-                } catch (IOException e) {
-                    break;
-                }
-            }
-        } catch (IOException e) {
-            Log.e(TAG, "Error streaming download: " + file.getAbsolutePath(), e);
         }
     }
 
@@ -510,8 +612,55 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
         return path.isEmpty() ? "/" : path;
     }
 
+    /**
+     * Read exactly up to (and including) the blank line that ends the HTTP headers.
+     * Reads byte-by-byte from the (buffered) stream so any following request's bytes
+     * stay in the buffer — required for correct keep-alive handling.
+     */
+    private String readHTTPRequest(InputStream in) throws IOException {
+        ByteArrayOutputStream requestData = new ByteArrayOutputStream();
+        int state = 0; // tracks the \r\n\r\n terminator
+
+        while (requestData.size() < MAX_HEADER_SIZE) {
+            int b = in.read();
+            if (b == -1) {
+                return requestData.size() > 0 ? requestData.toString("UTF-8") : null;
+            }
+            requestData.write(b);
+
+            switch (state) {
+                case 0: state = (b == '\r') ? 1 : 0; break;
+                case 1: state = (b == '\n') ? 2 : (b == '\r' ? 1 : 0); break;
+                case 2: state = (b == '\r') ? 3 : 0; break;
+                case 3:
+                    if (b == '\n') return requestData.toString("UTF-8");
+                    state = 0;
+                    break;
+            }
+        }
+
+        Log.w(TAG, "Request headers exceeded " + MAX_HEADER_SIZE + " bytes");
+        return null;
+    }
+
+    /** Parse request header lines (after the request line) into a lowercase-keyed map. */
+    private Map<String, String> parseHeaders(String[] lines) {
+        Map<String, String> headers = new HashMap<>();
+        for (int i = 1; i < lines.length; i++) {
+            String line = lines[i];
+            if (line.isEmpty()) break; // end of headers
+            int colon = line.indexOf(':');
+            if (colon > 0) {
+                String key = line.substring(0, colon).trim().toLowerCase();
+                String value = line.substring(colon + 1).trim();
+                headers.put(key, value);
+            }
+        }
+        return headers;
+    }
+
     // -------------------------------------------------------------------------
-    // Connection Handler (with HTTP Keep-Alive)
+    // Connection Handler
     // -------------------------------------------------------------------------
 
     private void handleConnection(Socket clientSocket) {
@@ -530,33 +679,29 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
                 return;
             }
 
-            clientSocket.setSoTimeout(30000); // 30s read timeout for first request
             clientSocket.setTcpNoDelay(true);  // Disable Nagle for lower latency
 
-            InputStream in = clientSocket.getInputStream();
+            // Buffered so readHTTPRequest can read byte-by-byte without per-byte syscalls,
+            // and so leftover bytes of a pipelined request survive between keep-alive iterations.
+            InputStream in = new BufferedInputStream(clientSocket.getInputStream(), 8192);
             OutputStream out = clientSocket.getOutputStream();
 
             int requestCount = 0;
             boolean keepAlive = true;
 
-            // Keep-Alive loop: handle multiple requests on the same connection
             while (keepAlive && requestCount < KEEPALIVE_MAX_REQUESTS && isServerRunning) {
 
-                // For subsequent requests, use shorter timeout (keep-alive idle timeout)
-                if (requestCount > 0) {
-                    clientSocket.setSoTimeout(KEEPALIVE_TIMEOUT * 1000);
-                }
+                // First request gets a generous timeout; subsequent ones use the keep-alive idle window.
+                clientSocket.setSoTimeout(requestCount == 0 ? 30000 : KEEPALIVE_TIMEOUT * 1000);
 
-                // Read request headers (8KB buffer)
-                byte[] buffer = new byte[HEADER_BUFFER_SIZE];
-                int bytesRead = in.read(buffer);
-                if (bytesRead <= 0) break; // Client closed or timeout
+                String requestStr = readHTTPRequest(in);
+                if (requestStr == null || requestStr.isEmpty()) break; // Client closed or idle timeout
 
                 requestCount++;
 
-                String requestStr = new String(buffer, 0, bytesRead, StandardCharsets.UTF_8);
                 String[] lines = requestStr.split("\r\n");
                 String requestLine = lines.length > 0 ? lines[0] : "";
+                Map<String, String> reqHeaders = parseHeaders(lines);
 
                 String requestPath = parseRequestPath(requestLine);
                 Log.i(TAG, "Request #" + requestCount + ": " + requestPath);
@@ -567,42 +712,37 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
                 if (requestParts.length > 0) {
                     httpMethod = requestParts[0].toUpperCase();
                 }
+                boolean headOnly = "HEAD".equals(httpMethod);
 
-                // Check Connection header from client (HTTP/1.1 defaults to keep-alive)
-                boolean clientWantsKeepAlive = true; // HTTP/1.1 default
-                for (String line : lines) {
-                    if (line.toLowerCase().startsWith("connection:")) {
-                        String val = line.substring(11).trim().toLowerCase();
-                        clientWantsKeepAlive = !"close".equals(val);
-                        break;
-                    }
-                }
-                keepAlive = clientWantsKeepAlive && (requestCount < KEEPALIVE_MAX_REQUESTS);
+                // Keep the connection alive unless the client asked to close or we hit the per-socket cap.
+                String connHeader = reqHeaders.get("connection");
+                boolean clientWantsClose = connHeader != null && connHeader.toLowerCase().contains("close");
+                keepAlive = !clientWantsClose && requestCount < KEEPALIVE_MAX_REQUESTS && isServerRunning;
 
                 // Handle OPTIONS preflight (CORS pre-flight check)
                 if ("OPTIONS".equals(httpMethod)) {
-                    sendHTTPResponse(out, 204, "No Content", "text/plain", new byte[0], null, keepAlive);
+                    sendHTTPResponse(out, 204, "No Content", "text/plain", new byte[0], null, keepAlive, headOnly);
                     continue;
                 }
 
                 // --- API Route: /ping → health check ---
                 if ("/ping".equals(requestPath) || "/ping/".equals(requestPath)) {
                     byte[] pingBody = ("{\"status\":true,\"message\":\"" + pingMessage + "\"}").getBytes(StandardCharsets.UTF_8);
-                    sendHTTPResponse(out, 200, "OK", "application/json; charset=utf-8", pingBody, null, keepAlive);
+                    sendHTTPResponse(out, 200, "OK", "application/json; charset=utf-8", pingBody, null, keepAlive, headOnly);
                     continue;
                 }
 
                 // --- API Route: /api/files → returns all files as JSON (recursive) ---
                 if ("/api/files".equals(requestPath) || "/api/files/".equals(requestPath)) {
                     byte[] jsonData = buildFilesJSONResponse();
-                    sendHTTPResponse(out, 200, "OK", "application/json; charset=utf-8", jsonData, null, keepAlive);
+                    sendHTTPResponse(out, 200, "OK", "application/json; charset=utf-8", jsonData, null, keepAlive, headOnly);
                     continue;
                 }
 
                 // --- API Route: /api/dir or /api/dir/<path> → list directory contents (non-recursive) ---
                 if ("/api/dir".equals(requestPath) || "/api/dir/".equals(requestPath)) {
                     byte[] jsonData = buildDirectoryJSONForPath("/");
-                    sendHTTPResponse(out, 200, "OK", "application/json; charset=utf-8", jsonData, null, keepAlive);
+                    sendHTTPResponse(out, 200, "OK", "application/json; charset=utf-8", jsonData, null, keepAlive, headOnly);
                     continue;
                 }
                 if (requestPath.startsWith("/api/dir/")) {
@@ -611,7 +751,7 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
                         dirSubPath = URLDecoder.decode(dirSubPath, "UTF-8");
                     } catch (Exception ignored) {}
                     byte[] jsonData = buildDirectoryJSONForPath(dirSubPath);
-                    sendHTTPResponse(out, 200, "OK", "application/json; charset=utf-8", jsonData, null, keepAlive);
+                    sendHTTPResponse(out, 200, "OK", "application/json; charset=utf-8", jsonData, null, keepAlive, headOnly);
                     continue;
                 }
 
@@ -634,7 +774,7 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
                         continue;
                     }
 
-                    sendFileWithDisposition(out, downloadFile, keepAlive);
+                    serveFile(out, downloadFile, keepAlive, headOnly, true, reqHeaders);
                     continue;
                 }
 
@@ -658,14 +798,14 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
                     // Check for index.html
                     File indexFile = new File(fullPath, "index.html");
                     if (indexFile.exists()) {
-                        sendFile(out, indexFile, keepAlive);
+                        serveFile(out, indexFile, keepAlive, headOnly, false, reqHeaders);
                     } else {
                         byte[] listing = buildDirectoryListingResponse(fullPath, requestPath);
-                        sendHTTPResponse(out, 200, "OK", "text/html; charset=utf-8", listing, null, keepAlive);
+                        sendHTTPResponse(out, 200, "OK", "text/html; charset=utf-8", listing, null, keepAlive, headOnly);
                     }
                 } else {
-                    // Stream file in chunks — handles large images/videos
-                    sendFile(out, fullPath, keepAlive);
+                    // Stream file in chunks (with Range/resume support) — handles large images/videos
+                    serveFile(out, fullPath, keepAlive, headOnly, false, reqHeaders);
                 }
             } // end while keep-alive loop
 
@@ -687,6 +827,11 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
 
     @ReactMethod
     public void start(double portNumber, String root, boolean localOnly, String pingMessage, Promise promise) {
+        // Run off the RN bridge thread — startInternal blocks (cleanup join/awaitTermination, bind retry).
+        controlExecutor.execute(() -> startInternal(portNumber, root, localOnly, pingMessage, promise));
+    }
+
+    private void startInternal(double portNumber, String root, boolean localOnly, String pingMessage, Promise promise) {
         // If already running, verify and return
         if (isServerRunning && serverSocket != null && !serverSocket.isClosed()) {
             try {
@@ -763,15 +908,19 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
         }
 
         try {
-            // Bounded thread pool: core=16, max=MAX_CONCURRENT_CONNECTIONS, queue=1024
-            // Prevents OOM from unbounded thread creation under heavy load
+            // Bounded thread pool: keep mobile file serving stable under gallery bursts.
+            // core == max so concurrency actually reaches MAX_CONCURRENT_CONNECTIONS; with a
+            // LinkedBlockingQueue a smaller core would never grow past core until the queue filled.
+            // allowCoreThreadTimeOut lets idle threads die so we don't hold MAX threads forever.
             connectionSemaphore = new Semaphore(MAX_CONCURRENT_CONNECTIONS);
-            executor = new ThreadPoolExecutor(
-                16,                           // core pool size
+            ThreadPoolExecutor pool = new ThreadPoolExecutor(
+                MAX_CONCURRENT_CONNECTIONS,    // core pool size
                 MAX_CONCURRENT_CONNECTIONS,    // max pool size
                 60L, TimeUnit.SECONDS,         // idle thread keepalive
                 new LinkedBlockingQueue<>(LISTEN_BACKLOG)  // work queue
             );
+            pool.allowCoreThreadTimeOut(true);
+            executor = pool;
 
             // Accept thread
             acceptThread = new Thread(() -> {
@@ -807,9 +956,12 @@ public class LocalServerModule extends ReactContextBaseJavaModule {
 
     @ReactMethod
     public void stop(Promise promise) {
-        forceCleanup();
-        Log.i(TAG, "Stopped");
-        promise.resolve(true);
+        // forceCleanup() joins the accept thread and awaits connection drain — keep it off the bridge.
+        controlExecutor.execute(() -> {
+            forceCleanup();
+            Log.i(TAG, "Stopped");
+            promise.resolve(true);
+        });
     }
 
     @ReactMethod

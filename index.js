@@ -196,4 +196,25 @@ export default class StaticServer {
   static async getIPAddress() {
     return LocalServer.getIPAddress();
   }
+
+  /**
+   * Stop any native server regardless of which JS instance created it.
+   * Useful after reloads or when the original JS ref has been lost.
+   * @returns {Promise<void>}
+   */
+  static async stopAll() {
+    try {
+      await LocalServer.stop();
+    } catch (e) {
+      console.warn('[LocalServer] Native stopAll error (ignored):', e.message);
+    }
+  }
+
+  /**
+   * Check native server state without relying on a specific JS instance.
+   * @returns {Promise<boolean>}
+   */
+  static async isNativeRunning() {
+    return LocalServer.isRunning();
+  }
 }
